@@ -1,6 +1,6 @@
 [package]
 name = "ballistics-engine-py"
-version = "0.13.10"
+version = "0.13.12"
 edition = "2021"
 authors = ["Alex Jokela <email@tinycomputers.io>"]
 description = "Python bindings for ballistics-engine"
@@ -12,7 +12,7 @@ name = "ballistics_engine_py"
 crate-type = ["cdylib"]
 
 [dependencies]
-ballistics-engine = "0.13.10"
+ballistics-engine = "0.13.12"
 pyo3 = { version = "0.22", features = ["extension-module"] }
 
 [profile.release]
