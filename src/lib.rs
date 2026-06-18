@@ -27,6 +27,7 @@ use ::ballistics_engine::{
     TrajectoryPoint as RustTrajectoryPoint,
 };
 
+mod effects;
 mod fast;
 mod helpers;
 mod montecarlo;
@@ -431,6 +432,14 @@ fn ballistics_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Parallel Monte Carlo (nested statistics/dispersion/metadata dict)
     m.add_function(pyo3::wrap_pyfunction!(montecarlo::monte_carlo_parallel, m)?)?;
+
+    // Stability / spin-drift / transonic scalar helpers
+    m.add_function(pyo3::wrap_pyfunction!(effects::transonic_correction, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(effects::get_projectile_shape, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(effects::compute_stability_advanced, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(effects::compute_spin_drift_advanced, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(effects::compute_spin_drift, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(effects::compute_stability_coefficient, m)?)?;
 
     // Version info
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
