@@ -16,6 +16,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Common, intentional patterns in PyO3 wrappers: many-arg pyfunctions mirroring
+// the Python API, and `default() + override-if-present` dict extraction.
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::field_reassign_with_default)]
+
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
 use ::ballistics_engine::{
@@ -349,7 +354,7 @@ impl PyBallisticInputs {
 
         // Convert imperial to metric
         inputs.bc_value = self.bc;
-        inputs.bc_type = self.drag_model.inner.clone();
+        inputs.bc_type = self.drag_model.inner;
         inputs.bullet_mass = self.bullet_weight_grains * GRAINS_TO_KG;
         inputs.muzzle_velocity = self.muzzle_velocity_fps * FPS_TO_MPS;
         inputs.bullet_diameter = self.bullet_diameter_inches * INCHES_TO_METERS;
