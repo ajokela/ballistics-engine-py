@@ -34,7 +34,7 @@ fn parse_drag_model(s: &str) -> PyResult<DragModel> {
 /// geometry/mass the Python layer supplies (grains/inches) to the SI the engine
 /// reads (kg/meters) and populate the imperial mirror fields. Call exactly once
 /// on a freshly-extracted inputs object (NOT idempotent).
-fn geometry_mass_to_si(inputs: &mut RustBallisticInputs) {
+pub(crate) fn geometry_mass_to_si(inputs: &mut RustBallisticInputs) {
     if inputs.caliber_inches == 0.0 {
         inputs.caliber_inches = inputs.bullet_diameter;
     }

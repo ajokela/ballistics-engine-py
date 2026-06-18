@@ -29,6 +29,7 @@ use ::ballistics_engine::{
 
 mod fast;
 mod helpers;
+mod montecarlo;
 
 // Unit conversion constants
 const GRAINS_TO_KG: f64 = 0.00006479891;
@@ -427,6 +428,9 @@ fn ballistics_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(helpers::calculate_atmosphere, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(helpers::calculate_air_density_cipm, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(helpers::get_local_atmosphere, m)?)?;
+
+    // Parallel Monte Carlo (nested statistics/dispersion/metadata dict)
+    m.add_function(pyo3::wrap_pyfunction!(montecarlo::monte_carlo_parallel, m)?)?;
 
     // Version info
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
