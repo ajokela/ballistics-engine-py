@@ -8,7 +8,7 @@
 //     over ballistics-engine's fast_trajectory::fast_integrate_with_segments.
 
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1};
-use pyo3::exceptions::{PyKeyError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use ::ballistics_engine::{BallisticInputs as RustBallisticInputs, DragModel};
@@ -261,4 +261,61 @@ pub fn derivatives<'py>(
 
     let r = compute_derivatives(pos, vel, &bi, wind_vector, atmos_tuple, bc_used, omega_vec, _t);
     Ok(PyArray1::from_vec(py, vec![r[0], r[1], r[2], r[3], r[4], r[5]]))
+}
+
+/// Solve the barrel elevation (radians) that zeroes at `target_distance_yards`,
+/// mirroring `ballistics_rust.calculate_zero_angle_rust`. NOTE the inputs dict here
+/// is FULLY imperial (fps/grains/inches/yards) — distinct from fast_integrate's SI
+/// dict — and is converted to SI in place. Raises on non-convergence (engine >=0.17.0
+/// returns Err where it previously returned a best-effort angle).
+#[pyfunction]
+#[pyo3(signature = (inputs, target_distance_yards, target_height_inches=0.0, wind_speed_mph=0.0, wind_direction_deg=0.0, temperature_f=59.0, pressure_inhg=29.92, humidity_pct=50.0, altitude_ft=0.0))]
+#[allow(clippy::too_many_arguments)]
+pub fn calculate_zero_angle(
+    inputs: &Bound<'_, PyDict>,
+    target_distance_yards: f64,
+    target_height_inches: f64,
+    wind_speed_mph: f64,
+    wind_direction_deg: f64,
+    temperature_f: f64,
+    pressure_inhg: f64,
+    humidity_pct: f64,
+    altitude_ft: f64,
+) -> PyResult<f64> {
+    use ::ballistics_engine::{
+        calculate_zero_angle_with_conditions, AtmosphericConditions, WindConditions,
+    };
+
+    let mut bi = ballistic_inputs_from_dict(inputs)?;
+    // Fully-imperial dict -> SI in place (matches ballistics_rust; NOT geometry_mass_to_si).
+    bi.muzzle_velocity *= 0.3048; // fps -> m/s
+    bi.bullet_mass *= GRAINS_TO_KG; // grains -> kg
+    bi.bullet_diameter *= INCHES_TO_METERS; // inches -> m
+    bi.bullet_length *= INCHES_TO_METERS; // inches -> m
+    bi.twist_rate *= INCHES_TO_METERS; // inches -> m
+    bi.sight_height *= INCHES_TO_METERS; // inches -> m
+
+    let wind = WindConditions {
+        speed: wind_speed_mph * 0.44704, // mph -> m/s
+        direction: wind_direction_deg.to_radians(),
+    };
+    let atmosphere = AtmosphericConditions {
+        temperature: (temperature_f - 32.0) * 5.0 / 9.0, // F -> C
+        pressure: pressure_inhg * 33.8639,               // inHg -> hPa
+        humidity: humidity_pct,
+        altitude: altitude_ft * 0.3048, // ft -> m
+    };
+
+    calculate_zero_angle_with_conditions(
+        bi,
+        target_distance_yards * 0.9144, // yards -> m
+        target_height_inches * INCHES_TO_METERS,
+        wind,
+        atmosphere,
+    )
+    .map_err(|e| {
+        PyRuntimeError::new_err(format!(
+            "Unable to find zero angle for target distance {target_distance_yards} yards: {e}"
+        ))
+    })
 }

@@ -417,6 +417,8 @@ fn ballistics_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(fast::fast_integrate, m)?)?;
     // Single RK-stage derivatives ([vx,vy,vz,ax,ay,az])
     m.add_function(pyo3::wrap_pyfunction!(fast::derivatives, m)?)?;
+    // Zero-angle solve (radians) from a fully-imperial inputs dict
+    m.add_function(pyo3::wrap_pyfunction!(fast::calculate_zero_angle, m)?)?;
 
     // Scalar query helpers (drag / atmosphere)
     m.add_function(pyo3::wrap_pyfunction!(helpers::get_drag_coefficient, m)?)?;
