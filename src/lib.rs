@@ -16,6 +16,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Common, intentional patterns in PyO3 wrappers: many-arg pyfunctions mirroring
+// the Python API, and `default() + override-if-present` dict extraction.
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::field_reassign_with_default)]
+
 use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
 use ::ballistics_engine::{
@@ -26,6 +31,11 @@ use ::ballistics_engine::{
     TrajectoryResult as RustTrajectoryResult,
     TrajectoryPoint as RustTrajectoryPoint,
 };
+
+mod effects;
+mod fast;
+mod helpers;
+mod montecarlo;
 
 // Unit conversion constants
 const GRAINS_TO_KG: f64 = 0.00006479891;
@@ -279,6 +289,53 @@ impl PyBallisticInputs {
         }
     }
 
+    /// Build a BallisticInputs from a dict of the binding's imperial field names
+    /// (bc, bullet_weight_grains, muzzle_velocity_fps, ...); missing keys fall back
+    /// to the constructor defaults. `drag_model` accepts a DragModel or a string.
+    #[staticmethod]
+    fn from_dict(d: &Bound<'_, pyo3::types::PyDict>) -> PyResult<Self> {
+        let f = |k: &str, default: f64| -> PyResult<f64> {
+            Ok(match d.get_item(k)? {
+                Some(v) if !v.is_none() => v.extract()?,
+                _ => default,
+            })
+        };
+        let drag_model = match d.get_item("drag_model")? {
+            Some(v) if !v.is_none() => {
+                if let Ok(dm) = v.extract::<PyDragModel>() {
+                    dm
+                } else {
+                    let s: String = v.extract()?;
+                    if s.contains("G1") {
+                        PyDragModel::g1()
+                    } else if s.contains("G8") {
+                        PyDragModel::g8()
+                    } else {
+                        PyDragModel::g7()
+                    }
+                }
+            }
+            _ => PyDragModel::g7(),
+        };
+        let is_right_twist = match d.get_item("is_right_twist")? {
+            Some(v) if !v.is_none() => v.extract()?,
+            _ => true,
+        };
+        Ok(PyBallisticInputs {
+            bc: f("bc", 0.5)?,
+            drag_model,
+            bullet_weight_grains: f("bullet_weight_grains", 168.0)?,
+            muzzle_velocity_fps: f("muzzle_velocity_fps", 2650.0)?,
+            bullet_diameter_inches: f("bullet_diameter_inches", 0.308)?,
+            bullet_length_inches: f("bullet_length_inches", 1.2)?,
+            sight_height_inches: f("sight_height_inches", 1.5)?,
+            zero_distance_yards: f("zero_distance_yards", 100.0)?,
+            shooting_angle_degrees: f("shooting_angle_degrees", 0.0)?,
+            twist_rate_inches: f("twist_rate_inches", 11.25)?,
+            is_right_twist,
+        })
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "BallisticInputs(bc={}, weight={}gr, mv={}fps, diameter={}\", zero={}yd)",
@@ -297,7 +354,7 @@ impl PyBallisticInputs {
 
         // Convert imperial to metric
         inputs.bc_value = self.bc;
-        inputs.bc_type = self.drag_model.inner.clone();
+        inputs.bc_type = self.drag_model.inner;
         inputs.bullet_mass = self.bullet_weight_grains * GRAINS_TO_KG;
         inputs.muzzle_velocity = self.muzzle_velocity_fps * FPS_TO_MPS;
         inputs.bullet_diameter = self.bullet_diameter_inches * INCHES_TO_METERS;
@@ -362,6 +419,32 @@ fn ballistics_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTrajectoryPoint>()?;
     m.add_class::<PyTrajectoryResult>()?;
     m.add_class::<PyTrajectorySolver>()?;
+
+    // Raw fixed-step integration kernel (scipy-like {t,y,t_events,success} contract)
+    m.add_function(pyo3::wrap_pyfunction!(fast::fast_integrate, m)?)?;
+    // Single RK-stage derivatives ([vx,vy,vz,ax,ay,az])
+    m.add_function(pyo3::wrap_pyfunction!(fast::derivatives, m)?)?;
+    // Zero-angle solve (radians) from a fully-imperial inputs dict
+    m.add_function(pyo3::wrap_pyfunction!(fast::calculate_zero_angle, m)?)?;
+
+    // Scalar query helpers (drag / atmosphere)
+    m.add_function(pyo3::wrap_pyfunction!(helpers::get_drag_coefficient, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(helpers::get_drag_coefficient_transonic, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(helpers::interpolated_bc, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(helpers::calculate_atmosphere, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(helpers::calculate_air_density_cipm, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(helpers::get_local_atmosphere, m)?)?;
+
+    // Parallel Monte Carlo (nested statistics/dispersion/metadata dict)
+    m.add_function(pyo3::wrap_pyfunction!(montecarlo::monte_carlo_parallel, m)?)?;
+
+    // Stability / spin-drift / transonic scalar helpers
+    m.add_function(pyo3::wrap_pyfunction!(effects::transonic_correction, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(effects::get_projectile_shape, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(effects::compute_stability_advanced, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(effects::compute_spin_drift_advanced, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(effects::compute_spin_drift, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(effects::compute_stability_coefficient, m)?)?;
 
     // Version info
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
