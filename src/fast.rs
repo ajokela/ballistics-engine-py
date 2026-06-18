@@ -11,7 +11,8 @@ use numpy::{PyArray1, PyArray2, PyReadonlyArray1};
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use ::ballistics_engine::{BallisticInputs as RustBallisticInputs, DragModel};
+use ::ballistics_engine::drag::DragTable;
+use ::ballistics_engine::{BCSegmentData, BallisticInputs as RustBallisticInputs, DragModel};
 
 const GRAINS_TO_KG: f64 = 0.00006479891;
 const INCHES_TO_METERS: f64 = 0.0254;
@@ -46,82 +47,183 @@ pub(crate) fn geometry_mass_to_si(inputs: &mut RustBallisticInputs) {
     inputs.bullet_length *= INCHES_TO_METERS;
 }
 
-/// Build a full engine `BallisticInputs` from the app's inputs dict, starting
-/// from engine defaults and overriding any key that is present (and non-None).
-/// Required: bc_value, bc_type. bc_segments / custom_drag_table are not yet
-/// wired (PoC scope) — they default to None.
+/// Velocity-segmented BC pairs (mach, bc) — mirrors ballistics_rust::extract_bc_segments.
+fn extract_bc_segments(segments: &Bound<'_, PyAny>) -> PyResult<Vec<(f64, f64)>> {
+    if segments.is_none() {
+        return Ok(Vec::new());
+    }
+    segments.extract::<Vec<(f64, f64)>>().map_err(|_| {
+        PyValueError::new_err("Could not extract BC segments - expected list of (f64, f64)")
+    })
+}
+
+/// Velocity-based BC segment data — mirrors ballistics_rust::extract_bc_segments_data.
+fn extract_bc_segments_data(data: &Bound<'_, PyAny>) -> PyResult<Vec<BCSegmentData>> {
+    let mut result = Vec::new();
+    if let Ok(list) = data.downcast::<PyList>() {
+        for item in list.iter() {
+            if let Ok(dict) = item.downcast::<PyDict>() {
+                let g = |k: &str| -> PyResult<f64> {
+                    dict.get_item(k)?
+                        .ok_or_else(|| PyKeyError::new_err(format!("BC segment missing {k}")))?
+                        .extract::<f64>()
+                };
+                result.push(BCSegmentData {
+                    velocity_min: g("velocity_min")?,
+                    velocity_max: g("velocity_max")?,
+                    bc_value: g("bc_value")?,
+                });
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Optional String field (None when absent or Python None).
+fn opt_string(d: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<String>> {
+    match d.get_item(key)? {
+        Some(v) if !v.is_none() => Ok(Some(v.extract::<String>()?)),
+        _ => Ok(None),
+    }
+}
+
+/// Build a full engine `BallisticInputs` from the app's inputs dict — a FAITHFUL
+/// port of ballistics_rust::extract_ballistic_inputs: same field defaults, the
+/// derived `enable_magnus`/`enable_coriolis`, parsed bc_segments / bc_segments_data
+/// / custom_drag_function, and the hardcoded integrator + datum defaults
+/// (use_rk4=true, use_adaptive_rk45=false, sight_height=0.0, ...). NOT a
+/// default()+override (that silently diverged on absent keys). Required keys:
+/// bc_value, bc_type, bullet_mass, altitude.
 pub(crate) fn ballistic_inputs_from_dict(d: &Bound<'_, PyDict>) -> PyResult<RustBallisticInputs> {
-    let mut inp = RustBallisticInputs::default();
-
-    inp.bc_value = d
-        .get_item("bc_value")?
-        .ok_or_else(|| PyKeyError::new_err("Missing required field: bc_value"))?
-        .extract()?;
-    let bc_type: String = d
-        .get_item("bc_type")?
-        .ok_or_else(|| PyKeyError::new_err("Missing required field: bc_type"))?
-        .extract()?;
-    inp.bc_type = parse_drag_model(&bc_type)?;
-
-    // Override-if-present: keeps the engine default when a key is absent/None.
-    macro_rules! set {
-        ($key:literal, $field:ident) => {
-            if let Some(v) = d.get_item($key)? {
-                if !v.is_none() {
-                    inp.$field = v.extract()?;
-                }
+    macro_rules! req {
+        ($key:literal) => {
+            d.get_item($key)?
+                .ok_or_else(|| PyKeyError::new_err(concat!("Missing required field: ", $key)))?
+                .extract()?
+        };
+    }
+    macro_rules! opt {
+        ($key:literal, $default:expr) => {
+            match d.get_item($key)? {
+                Some(v) if !v.is_none() => v.extract()?,
+                _ => $default,
             }
         };
     }
-    set!("bullet_mass", bullet_mass);
-    set!("muzzle_velocity", muzzle_velocity);
-    set!("bullet_diameter", bullet_diameter);
-    set!("bullet_length", bullet_length);
-    set!("altitude", altitude);
-    set!("twist_rate", twist_rate);
-    set!("is_twist_right", is_twist_right);
-    set!("target_distance", target_distance);
-    set!("muzzle_angle", muzzle_angle);
-    set!("wind_speed", wind_speed);
-    set!("wind_angle", wind_angle);
-    set!("temperature", temperature);
-    set!("pressure", pressure);
-    set!("humidity", humidity);
-    set!("latitude", latitude);
-    set!("shooting_angle", shooting_angle);
-    set!("sight_height", sight_height);
-    set!("ground_threshold", ground_threshold);
-    set!("caliber_inches", caliber_inches);
-    set!("weight_grains", weight_grains);
-    set!("enable_advanced_effects", enable_advanced_effects);
-    set!("enable_magnus", enable_magnus);
-    set!("enable_coriolis", enable_coriolis);
-    set!("use_powder_sensitivity", use_powder_sensitivity);
-    set!("powder_temp_sensitivity", powder_temp_sensitivity);
-    set!("powder_temp", powder_temp);
-    set!("tipoff_yaw", tipoff_yaw);
-    set!("tipoff_decay_distance", tipoff_decay_distance);
-    set!("use_bc_segments", use_bc_segments);
-    set!("use_enhanced_spin_drift", use_enhanced_spin_drift);
-    set!("use_form_factor", use_form_factor);
-    set!("enable_wind_shear", enable_wind_shear);
-    set!("wind_shear_model", wind_shear_model);
-    set!("enable_trajectory_sampling", enable_trajectory_sampling);
-    set!("sample_interval", sample_interval);
-    set!("enable_pitch_damping", enable_pitch_damping);
-    set!("enable_precession_nutation", enable_precession_nutation);
-    set!("use_cluster_bc", use_cluster_bc);
-    set!("use_rk4", use_rk4);
-    set!("use_adaptive_rk45", use_adaptive_rk45);
 
-    Ok(inp)
+    let bc_value: f64 = req!("bc_value");
+    let bc_type: String = req!("bc_type");
+    let bc_type_enum = parse_drag_model(&bc_type)?;
+    let bullet_mass: f64 = req!("bullet_mass");
+    let altitude: f64 = req!("altitude");
+
+    let latitude: Option<f64> = match d.get_item("latitude")? {
+        Some(v) if !v.is_none() => Some(v.extract()?),
+        _ => None,
+    };
+    let bullet_cluster: Option<usize> = match d.get_item("bullet_cluster")? {
+        Some(v) if !v.is_none() => Some(v.extract()?),
+        _ => None,
+    };
+    let enable_advanced_effects: bool = opt!("enable_advanced_effects", false);
+
+    let bc_segments = match d.get_item("bc_segments")? {
+        Some(s) if !s.is_none() => {
+            let v = extract_bc_segments(&s)?;
+            if v.is_empty() { None } else { Some(v) }
+        }
+        _ => None,
+    };
+    let bc_segments_data = match d.get_item("bc_segments_data")? {
+        Some(s) if !s.is_none() => {
+            let v = extract_bc_segments_data(&s)?;
+            if v.is_empty() { None } else { Some(v) }
+        }
+        _ => None,
+    };
+    let custom_drag_table = match d.get_item("custom_drag_function")? {
+        Some(cdm) if !cdm.is_none() => match cdm.downcast::<PyDict>() {
+            Ok(dict) => {
+                let mach = dict
+                    .get_item("mach_numbers")?
+                    .and_then(|v| v.extract::<Vec<f64>>().ok());
+                let cd = dict
+                    .get_item("drag_coefficients")?
+                    .and_then(|v| v.extract::<Vec<f64>>().ok());
+                match (mach, cd) {
+                    (Some(m), Some(c)) if m.len() == c.len() && !m.is_empty() => {
+                        Some(DragTable::new(m, c))
+                    }
+                    _ => None,
+                }
+            }
+            Err(_) => None,
+        },
+        _ => None,
+    };
+
+    Ok(RustBallisticInputs {
+        bc_value,
+        bc_type: bc_type_enum,
+        bullet_mass,
+        muzzle_velocity: opt!("muzzle_velocity", 0.0),
+        altitude,
+        twist_rate: opt!("twist_rate", 0.0),
+        bullet_length: opt!("bullet_length", 0.0),
+        bullet_diameter: opt!("bullet_diameter", 0.0),
+        target_distance: opt!("target_distance", 0.0),
+        muzzle_angle: opt!("muzzle_angle", 0.0),
+        wind_speed: opt!("wind_speed", 0.0),
+        wind_angle: opt!("wind_angle", 0.0),
+        temperature: opt!("temperature", 15.0),
+        pressure: opt!("pressure", 1013.25),
+        humidity: opt!("humidity", 0.0),
+        latitude,
+        enable_advanced_effects,
+        enable_magnus: enable_advanced_effects,
+        enable_coriolis: enable_advanced_effects && latitude.is_some(),
+        is_twist_right: opt!("is_twist_right", true),
+        shooting_angle: opt!("shooting_angle", 0.0),
+        azimuth_angle: 0.0,
+        use_powder_sensitivity: opt!("use_powder_sensitivity", false),
+        powder_temp_sensitivity: opt!("powder_temp_sensitivity", 0.0),
+        powder_temp: opt!("powder_temp", 70.0),
+        tipoff_yaw: opt!("tipoff_yaw", 0.0),
+        tipoff_decay_distance: opt!("tipoff_decay_distance", 20.0),
+        ground_threshold: opt!("ground_threshold", -100.0),
+        bc_segments,
+        caliber_inches: opt!("caliber_inches", 0.0),
+        weight_grains: opt!("weight_grains", 0.0),
+        use_bc_segments: opt!("use_bc_segments", false),
+        bullet_id: opt_string(d, "bullet_id")?,
+        bc_segments_data,
+        use_enhanced_spin_drift: false,
+        use_form_factor: opt!("use_form_factor", true),
+        manufacturer: opt_string(d, "manufacturer")?,
+        bullet_model: opt_string(d, "bullet_model")?,
+        enable_wind_shear: opt!("enable_wind_shear", false),
+        wind_shear_model: opt!("wind_shear_model", "none".to_string()),
+        use_cluster_bc: opt!("use_cluster_bc", false),
+        bullet_cluster,
+        custom_drag_table,
+        bc_type_str: Some(bc_type),
+        enable_pitch_damping: false,
+        enable_precession_nutation: false,
+        use_rk4: true,
+        use_adaptive_rk45: false,
+        enable_trajectory_sampling: false,
+        sample_interval: 10.0,
+        sight_height: 0.0,
+        muzzle_height: 0.0,
+        target_height: 0.0,
+    })
 }
 
 /// Fast fixed-step trajectory integration over ballistics-engine's RK45 kernel.
 /// Mirrors `ballistics_rust.fast_integrate_rust` exactly: same positional args and
 /// the same `{t, y, t_events, success}` return contract the app's integrator reads.
 ///
-/// `wind_segments` is a list of (speed_mps, angle_rad, up_to_range_m) tuples
+/// `wind_segments` is a list of (speed_kmh, angle_deg, until_distance_m) tuples
 /// (engine `wind::WindSegment`); empty = no wind. `atmo_params` = 4-vector
 /// (base_altitude_m, base_temp_c, base_pressure_hpa, base_density_ratio).
 #[pyfunction]

@@ -5,6 +5,7 @@
 // {statistics, dispersion, metadata} result dict.
 
 use numpy::PyReadonlyArray2;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rayon::prelude::*;
@@ -85,31 +86,47 @@ pub fn monte_carlo_parallel<'py>(
     include_dispersion: bool,
     max_viz_points: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let _ = num_threads; // default rayon pool; thread count does not affect results
+    // Honor num_threads via a scoped pool (0 -> error, mirroring ballistics_rust's
+    // configure_thread_pool); None -> default global pool.
+    let pool = match num_threads {
+        Some(0) => return Err(PyValueError::new_err("Thread count must be greater than 0")),
+        Some(n) => Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build()
+                .map_err(|e| PyValueError::new_err(format!("Failed to build thread pool: {e}")))?,
+        ),
+        None => None,
+    };
 
     let base = crate::fast::ballistic_inputs_from_dict(base_inputs)?;
     let samples = param_samples.as_array();
     let n_samples = samples.shape()[0];
-    let n_params = if samples.ndim() >= 2 { samples.shape()[1] } else { 0 };
+    let n_params = samples.shape()[1];
 
-    // Materialize sample rows (owned, Send) so the parallel closure is GIL-free.
+    // Materialize sample rows (owned, Send) for the parallel closure.
     let rows: Vec<Vec<f64>> = (0..n_samples)
         .map(|i| (0..n_params).map(|j| samples[[i, j]]).collect())
         .collect();
 
-    let results: Vec<Option<TrajectoryOutput>> = rows
-        .par_iter()
-        .map(|row| {
-            let mut ri = base.clone();
-            for (j, name) in param_names.iter().enumerate() {
-                if j < row.len() {
-                    apply_parameter(&mut ri, name, row[j]);
+    let run = || {
+        rows.par_iter()
+            .map(|row| {
+                let mut ri = base.clone();
+                for (j, name) in param_names.iter().enumerate() {
+                    if j < row.len() {
+                        apply_parameter(&mut ri, name, row[j]);
+                    }
                 }
-            }
-            mc_inputs_to_si(&mut ri);
-            solve_trajectory_for_monte_carlo(&ri).ok()
-        })
-        .collect();
+                mc_inputs_to_si(&mut ri);
+                solve_trajectory_for_monte_carlo(&ri).ok()
+            })
+            .collect::<Vec<_>>()
+    };
+    let results: Vec<Option<TrajectoryOutput>> = match &pool {
+        Some(p) => p.install(run),
+        None => run(),
+    };
 
     let valid: Vec<&TrajectoryOutput> = results.iter().filter_map(|r| r.as_ref()).collect();
     let valid_runs = valid.len();
