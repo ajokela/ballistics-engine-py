@@ -414,6 +414,8 @@ fn ballistics_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Raw fixed-step integration kernel (scipy-like {t,y,t_events,success} contract)
     m.add_function(pyo3::wrap_pyfunction!(fast::fast_integrate, m)?)?;
+    // Single RK-stage derivatives ([vx,vy,vz,ax,ay,az])
+    m.add_function(pyo3::wrap_pyfunction!(fast::derivatives, m)?)?;
 
     // Version info
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;

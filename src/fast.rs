@@ -180,3 +180,85 @@ pub fn fast_integrate<'py>(
     dict.set_item("success", solution.success)?;
     Ok(dict)
 }
+
+/// Single RK-stage derivatives, mirroring `ballistics_rust.derivatives_rust`:
+/// returns the 6-vector d(state)/dt = [vx, vy, vz, ax, ay, az] for the McCoy-frame
+/// state, over ballistics-engine's `derivatives::compute_derivatives`.
+#[pyfunction]
+#[pyo3(signature = (_t, state, inputs, wind_segments, atmos_params, bc_used, _target_horizontal_dist_m, _target_vertical_height_m, omega_vector=None))]
+#[allow(clippy::too_many_arguments)]
+pub fn derivatives<'py>(
+    py: Python<'py>,
+    _t: f64,
+    state: PyReadonlyArray1<'py, f64>,
+    inputs: &Bound<'py, PyDict>,
+    wind_segments: Vec<(f64, f64, f64)>,
+    atmos_params: PyReadonlyArray1<'py, f64>,
+    bc_used: f64,
+    _target_horizontal_dist_m: f64,
+    _target_vertical_height_m: f64,
+    omega_vector: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    use ::ballistics_engine::derivatives::compute_derivatives;
+    use ::ballistics_engine::wind::WindSock;
+    use ::ballistics_engine::wind_shear::{
+        WindLayer, WindShearModel, WindShearProfile, WindShearWindSock,
+    };
+    use nalgebra::Vector3;
+
+    let state_array = state.as_array();
+    let atmos_array = atmos_params.as_array();
+    if state_array.len() != 6 {
+        return Err(PyValueError::new_err("State array must have 6 elements"));
+    }
+    if atmos_array.len() != 4 {
+        return Err(PyValueError::new_err("Atmospheric parameters must have 4 elements"));
+    }
+
+    // Python solver layer and ballistics-engine both use the McCoy frame.
+    let pos = Vector3::new(state_array[0], state_array[1], state_array[2]);
+    let vel = Vector3::new(state_array[3], state_array[4], state_array[5]);
+    let atmos_tuple = (atmos_array[0], atmos_array[1], atmos_array[2], atmos_array[3]);
+
+    let mut bi = ballistic_inputs_from_dict(inputs)?;
+    geometry_mass_to_si(&mut bi);
+
+    let wind_vector = if bi.enable_wind_shear && bi.wind_shear_model != "none" {
+        let mut profile = WindShearProfile {
+            model: match bi.wind_shear_model.as_str() {
+                "logarithmic" => WindShearModel::Logarithmic,
+                "power_law" => WindShearModel::PowerLaw,
+                "ekman_spiral" => WindShearModel::EkmanSpiral,
+                _ => WindShearModel::None,
+            },
+            ..Default::default()
+        };
+        if !wind_segments.is_empty() {
+            profile.surface_wind = WindLayer {
+                altitude_m: 0.0,
+                speed_mps: wind_segments[0].0 * 0.2777778, // km/h -> m/s at reference height
+                direction_deg: wind_segments[0].1,
+            };
+        }
+        let sock =
+            WindShearWindSock::with_shooter_altitude(wind_segments, Some(profile), bi.altitude);
+        sock.vector_for_position(pos)
+    } else {
+        let sock = WindSock::new(wind_segments);
+        sock.vector_for_range_stateless(pos[0])
+    };
+
+    let omega_vec = match omega_vector {
+        Some(o) => {
+            let s = o.as_array();
+            if s.len() != 3 {
+                return Err(PyValueError::new_err("Omega vector must have 3 elements"));
+            }
+            Some(Vector3::new(s[0], s[1], s[2]))
+        }
+        None => None,
+    };
+
+    let r = compute_derivatives(pos, vel, &bi, wind_vector, atmos_tuple, bc_used, omega_vec, _t);
+    Ok(PyArray1::from_vec(py, vec![r[0], r[1], r[2], r[3], r[4], r[5]]))
+}

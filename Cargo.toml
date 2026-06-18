@@ -15,6 +15,7 @@ crate-type = ["cdylib"]
 ballistics-engine = { version = "0.17.0", default-features = false }
 pyo3 = { version = "0.26", features = ["extension-module", "abi3-py38", "generate-import-lib"] }
 numpy = "0.26"
+nalgebra = "0.34"
 
 [profile.release]
 opt-level = 3
