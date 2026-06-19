@@ -209,6 +209,7 @@ pub(crate) fn ballistic_inputs_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Rust
         bc_type_str: Some(bc_type),
         enable_pitch_damping: false,
         enable_precession_nutation: false,
+        enable_aerodynamic_jump: opt!("enable_aerodynamic_jump", false),
         use_rk4: true,
         use_adaptive_rk45: false,
         enable_trajectory_sampling: false,
