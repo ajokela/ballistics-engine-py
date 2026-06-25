@@ -185,7 +185,9 @@ pub(crate) fn ballistic_inputs_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Rust
         is_twist_right: opt!("is_twist_right", true),
         shooting_angle: opt!("shooting_angle", 0.0),
         azimuth_angle: 0.0,
-        shot_azimuth: 0.0, // engine 0.21.0 Coriolis bearing; fast/MC path is North-locked here
+        // Coriolis firing bearing (engine 0.21.0+): degrees, 0=N, 90=E. Drives the
+        // Eotvos vertical term + lateral azimuth on the fast/MC path.
+        shot_azimuth: opt!("shot_direction", 0.0_f64).to_radians(),
         use_powder_sensitivity: opt!("use_powder_sensitivity", false),
         powder_temp_sensitivity: opt!("powder_temp_sensitivity", 0.0),
         powder_temp: opt!("powder_temp", 70.0),
