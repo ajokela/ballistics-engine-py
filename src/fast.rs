@@ -181,7 +181,9 @@ pub(crate) fn ballistic_inputs_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Rust
         latitude,
         enable_advanced_effects,
         enable_magnus: enable_advanced_effects,
-        enable_coriolis: enable_advanced_effects && latitude.is_some(),
+        // Coriolis is independent of advanced effects (engine 0.21.2+): default to the
+        // historical derivation, but let callers request Coriolis-only via the dict key.
+        enable_coriolis: opt!("enable_coriolis", enable_advanced_effects && latitude.is_some()),
         is_twist_right: opt!("is_twist_right", true),
         shooting_angle: opt!("shooting_angle", 0.0),
         azimuth_angle: 0.0,
