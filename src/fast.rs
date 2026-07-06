@@ -222,6 +222,9 @@ pub(crate) fn ballistic_inputs_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Rust
         sight_height: 0.0,
         muzzle_height: 0.0,
         target_height: 0.0,
+        // Fill any fields added to BallisticInputs upstream (e.g. powder_temp_curve,
+        // powder_curve_temp_c) with their defaults so a crate bump doesn't break the build.
+        ..Default::default()
     })
 }
 
