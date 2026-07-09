@@ -202,7 +202,12 @@ pub(crate) fn ballistic_inputs_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Rust
         use_bc_segments: opt!("use_bc_segments", false),
         bullet_id: opt_string(d, "bullet_id")?,
         bc_segments_data,
-        use_enhanced_spin_drift: false,
+        // MBA-1134: enable the engine's canonical Litz spin drift on the fast path when the
+        // caller requests advanced effects (mirrors enable_magnus above and the CLI). This was
+        // hardcoded false, so the single-shot fast path / API silently carried NO spin drift —
+        // twist direction had no effect on windage. Honor an explicit request if the caller
+        // sets it, otherwise derive from enable_advanced_effects.
+        use_enhanced_spin_drift: opt!("use_enhanced_spin_drift", enable_advanced_effects),
         use_form_factor: opt!("use_form_factor", true),
         manufacturer: opt_string(d, "manufacturer")?,
         bullet_model: opt_string(d, "bullet_model")?,
