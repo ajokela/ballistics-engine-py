@@ -241,7 +241,7 @@ pub(crate) fn ballistic_inputs_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Rust
 /// (engine `wind::WindSegment`); empty = no wind. `atmo_params` = 4-vector
 /// (base_altitude_m, base_temp_c, base_pressure_hpa, base_density_ratio).
 #[pyfunction]
-#[pyo3(signature = (inputs, wind_segments, horiz, vert, initial_state, t_span, atmo_params))]
+#[pyo3(signature = (inputs, wind_segments, horiz, vert, initial_state, t_span, atmo_params, atmo_segments=Vec::new()))]
 pub fn fast_integrate<'py>(
     py: Python<'py>,
     inputs: &Bound<'py, PyDict>,
@@ -251,7 +251,12 @@ pub fn fast_integrate<'py>(
     initial_state: PyReadonlyArray1<'py, f64>,
     t_span: (f64, f64),
     atmo_params: PyReadonlyArray1<'py, f64>,
+    // MBA-1137: per-zone downrange atmosphere (temp_c, pressure_hpa, humidity_%, until_distance_m),
+    // station-referenced. Empty = single-station (unchanged). Builds an engine AtmoSock so drag
+    // density varies by downrange distance, composing with the altitude lapse.
+    atmo_segments: Vec<(f64, f64, f64, f64)>,
 ) -> PyResult<Bound<'py, PyDict>> {
+    use ::ballistics_engine::atmosphere::AtmoSock;
     use ::ballistics_engine::fast_trajectory::{fast_integrate_with_segments, FastIntegrationParams};
 
     let mut bi = ballistic_inputs_from_dict(inputs)?;
@@ -273,12 +278,18 @@ pub fn fast_integrate<'py>(
 
     // Both the Python solver layer and ballistics-engine use the McCoy frame, so
     // the initial state passes straight through with no axis swap.
+    let atmo_sock = if atmo_segments.is_empty() {
+        None
+    } else {
+        Some(AtmoSock::new(atmo_segments))
+    };
     let params = FastIntegrationParams {
         horiz,
         vert,
         initial_state: initial_state_arr,
         t_span,
         atmo_params: (ap[0], ap[1], ap[2], ap[3]),
+        atmo_sock,
     };
 
     let solution = fast_integrate_with_segments(&bi, wind_segments, params);
@@ -375,7 +386,12 @@ pub fn derivatives<'py>(
         None => None,
     };
 
-    let r = compute_derivatives(pos, vel, &bi, wind_vector, atmos_tuple, bc_used, omega_vec, _t);
+    // MBA-1137: this per-step derivatives entry backs the deprecated scipy/legacy solver path,
+    // not the live fast_integrate path. Per-zone atmosphere is not threaded here (no downrange
+    // context per RK stage); pass None so it behaves as single-station, same as today.
+    let r = compute_derivatives(
+        pos, vel, &bi, wind_vector, atmos_tuple, bc_used, omega_vec, _t, None,
+    );
     Ok(PyArray1::from_vec(py, vec![r[0], r[1], r[2], r[3], r[4], r[5]]))
 }
 
