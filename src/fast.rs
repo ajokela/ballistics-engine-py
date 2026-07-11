@@ -16,6 +16,16 @@ use ::ballistics_engine::{BCSegmentData, BallisticInputs as RustBallisticInputs,
 
 const GRAINS_TO_KG: f64 = 0.00006479891;
 const INCHES_TO_METERS: f64 = 0.0254;
+const KMH_TO_MPS: f64 = 1000.0 / 3600.0;
+
+fn wind_segments_kmh_to_mps(segments: Vec<(f64, f64, f64)>) -> Vec<(f64, f64, f64)> {
+    segments
+        .into_iter()
+        .map(|(speed_kmh, angle_deg, until_distance_m)| {
+            (speed_kmh * KMH_TO_MPS, angle_deg, until_distance_m)
+        })
+        .collect()
+}
 
 fn parse_drag_model(s: &str) -> PyResult<DragModel> {
     Ok(match s {
@@ -363,12 +373,15 @@ pub fn derivatives<'py>(
         if !wind_segments.is_empty() {
             profile.surface_wind = WindLayer {
                 altitude_m: 0.0,
-                speed_mps: wind_segments[0].0 * 0.2777778, // km/h -> m/s at reference height
+                speed_mps: wind_segments[0].0 * KMH_TO_MPS,
                 direction_deg: wind_segments[0].1,
             };
         }
-        let sock =
-            WindShearWindSock::with_shooter_altitude(wind_segments, Some(profile), bi.altitude);
+        let sock = WindShearWindSock::with_shooter_altitude(
+            wind_segments_kmh_to_mps(wind_segments),
+            Some(profile),
+            bi.altitude,
+        );
         sock.vector_for_position(pos)
     } else {
         let sock = WindSock::new(wind_segments);
@@ -450,4 +463,24 @@ pub fn calculate_zero_angle(
             "Unable to find zero angle for target distance {target_distance_yards} yards: {e}"
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::ballistics_engine::wind::WindSock;
+    use ::ballistics_engine::wind_shear::WindShearWindSock;
+    use nalgebra::Vector3;
+
+    #[test]
+    fn shear_and_uniform_wind_segments_share_the_kmh_contract() {
+        let segments = vec![(36.0, 90.0, 1_000.0)];
+
+        let uniform = WindSock::new(segments.clone()).vector_for_range_stateless(100.0);
+        let shear = WindShearWindSock::new(wind_segments_kmh_to_mps(segments), None)
+            .vector_for_position(Vector3::new(100.0, 0.0, 0.0));
+
+        assert!((uniform.z - shear.z).abs() < 1e-12);
+        assert!((shear.norm() - 36.0 * KMH_TO_MPS).abs() < 1e-12);
+    }
 }
