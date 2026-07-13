@@ -396,6 +396,133 @@ def test_run_monte_carlo_hit_probability():
     check("target_plane_cep_m is None or non-negative float", cep is None or cep >= 0.0)
 
 
+def test_monte_carlo_parallel_full_vs_fast_agreement():
+    """MBA-1295 Phase 3: `use_full_solver=True` (TrajectorySolver) must agree closely with
+    the historical `use_full_solver=False` fast path (solve_trajectory_for_monte_carlo) --
+    this is the whole point of the phase (kill the cross-solver divergence between
+    monte_carlo_parallel and /v1/calculate). monte_carlo_parallel only returns AGGREGATE
+    statistics, not raw per-sample rows, so this drives it with a single-sample (n=1)
+    param_samples array per row: with valid_runs==1 the reported "mean" is exactly that one
+    trajectory's output (see the valid_runs == 1 branch in montecarlo.rs), giving an exact
+    per-sample comparison for a handful of distinct rows."""
+    print("test_monte_carlo_parallel_full_vs_fast_agreement")
+    import numpy as np
+
+    from ballistics_engine import monte_carlo_parallel
+
+    base = {
+        "bc_value": 0.5,
+        "bc_type": "G1",
+        "muzzle_velocity": 2800.0,
+        "bullet_mass": 175.0,
+        "target_distance": 500.0,
+        "bullet_diameter": 0.308,
+        "bullet_length": 1.2,
+        "twist_rate": 10.0,
+        "temperature": 15.0,
+        "pressure": 1013.25,
+        "humidity": 50.0,
+        "altitude": 0.0,
+        "sight_height": 1.5,
+    }
+    # Crosswind base (wind_angle=90, matches the engine's headwind=0/from-the-right=90
+    # convention) so the wind_speed row below produces a NONZERO wind_drift_m -- the plain
+    # headwind base above would give a trivial 0 vs 0 "agreement" for that field.
+    crosswind_base = dict(base, wind_angle=90.0)
+
+    # A handful of distinct single-parameter rows spanning the kind of jitter a real MC
+    # param_stddevs call would sample (muzzle_velocity fps, bc_value, wind_speed km/h).
+    rows = [
+        (base, "muzzle_velocity", 2790.0),
+        (base, "muzzle_velocity", 2820.0),
+        (base, "bc_value", 0.495),
+        (base, "bc_value", 0.51),
+        (crosswind_base, "wind_speed", 8.0),
+    ]
+    fields = ["drop_m", "wind_drift_m", "time_of_flight_s", "final_vel_fps", "energy_ft_lbs", "mach"]
+
+    for base_dict, name, value in rows:
+        samples = np.array([[value]])
+        fast = monte_carlo_parallel(base_dict, samples, [name], None, False, 500, False)
+        full = monte_carlo_parallel(base_dict, samples, [name], None, False, 500, True)
+        check(
+            f"{name}={value}: fast path solved (valid_runs==1)",
+            fast["metadata"]["valid_runs"] == 1,
+            fast["metadata"],
+        )
+        check(
+            f"{name}={value}: full solver solved (valid_runs==1)",
+            full["metadata"]["valid_runs"] == 1,
+            full["metadata"],
+        )
+        for f in fields:
+            fv = fast["statistics"][f]["mean"]
+            gv = full["statistics"][f]["mean"]
+            denom = max(abs(fv), 1e-9)
+            rel = abs(fv - gv) / denom
+            check(
+                f"{name}={value}: {f} agrees within 1% (fast={fv:.6g} full={gv:.6g})",
+                rel < 0.01,
+                f"rel_diff={rel*100:.4f}%",
+            )
+
+
+def test_monte_carlo_parallel_hit_probability_sane():
+    """MBA-1295 Phase 3: the additive dispersion.hit_probability / hit_radius_m /
+    target_plane_cep_m fields must be present and sane for both use_full_solver values."""
+    print("test_monte_carlo_parallel_hit_probability_sane")
+    import numpy as np
+
+    from ballistics_engine import monte_carlo_parallel
+
+    base = {
+        "bc_value": 0.5,
+        "bc_type": "G1",
+        "muzzle_velocity": 2800.0,
+        "bullet_mass": 175.0,
+        "target_distance": 200.0,  # short range so a tight mechanical jitter can land hits
+        "bullet_diameter": 0.308,
+        "bullet_length": 1.2,
+        "twist_rate": 10.0,
+        "temperature": 15.0,
+        "pressure": 1013.25,
+        "humidity": 50.0,
+        "altitude": 0.0,
+        "sight_height": 1.5,
+        "muzzle_angle": 0.5,  # a bit of elevation so the group centers near the point of aim
+    }
+    rng = np.random.default_rng(1295)
+    n = 200
+    samples = np.column_stack([
+        rng.normal(2800.0, 5.0, n),
+        rng.normal(0.5, 0.003, n),
+    ])
+    names = ["muzzle_velocity", "bc_value"]
+
+    for use_full_solver in (False, True):
+        out = monte_carlo_parallel(base, samples, names, None, True, 500, use_full_solver, 5.0)
+        disp = out.get("dispersion")
+        check(f"dispersion present (use_full_solver={use_full_solver})", disp is not None)
+        if disp is None:
+            continue
+        hp = disp.get("hit_probability")
+        check(
+            f"hit_probability in [0, 1] (use_full_solver={use_full_solver})",
+            hp is not None and 0.0 <= hp <= 1.0,
+            f"hp={hp}",
+        )
+        check(
+            f"hit_radius_m round-trips the passed radius (use_full_solver={use_full_solver})",
+            abs(disp.get("hit_radius_m", -1.0) - 5.0) < 1e-9,
+        )
+        cep = disp.get("target_plane_cep_m")
+        check(
+            f"target_plane_cep_m is a non-negative float (use_full_solver={use_full_solver})",
+            cep is not None and cep >= 0.0,
+            f"cep={cep}",
+        )
+
+
 def main():
     tests = [
         test_backward_compat_legacy_from_dict,
@@ -411,6 +538,8 @@ def main():
         test_from_dict_missing_sight_height_defaults_to_1_5_inches,
         test_monte_carlo_parallel_drop_is_bore_relative,
         test_run_monte_carlo_hit_probability,
+        test_monte_carlo_parallel_full_vs_fast_agreement,
+        test_monte_carlo_parallel_hit_probability_sane,
     ]
     for t in tests:
         try:

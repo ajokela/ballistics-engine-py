@@ -13,7 +13,13 @@ use ::ballistics_engine::monte_carlo::{
     calculate_cep, calculate_confidence_ellipse, percentile, sample_points_for_visualization,
     solve_trajectory_for_monte_carlo, TrajectoryOutput,
 };
-use ::ballistics_engine::BallisticInputs as RustBallisticInputs;
+use ::ballistics_engine::atmosphere::{calculate_atmosphere, resolve_station_conditions};
+use ::ballistics_engine::spin_drift::{effective_sg_from_inputs, litz_drift_meters};
+use ::ballistics_engine::{
+    AtmosphericConditions as RustAtmosphericConditions, BallisticInputs as RustBallisticInputs,
+    TrajectoryPoint as RustTrajectoryPoint, TrajectorySolver as RustTrajectorySolver,
+    WindConditions as RustWindConditions, DEFAULT_HIT_RADIUS_M,
+};
 
 const M_TO_INCHES: f64 = 39.3701;
 const FIELDS: [&str; 6] = [
@@ -83,8 +89,144 @@ fn mc_inputs_to_si(i: &mut RustBallisticInputs) {
     crate::fast::geometry_mass_to_si(i); // mass/diameter/length + caliber/weight mirrors
 }
 
+/// Interpolate (y, z, velocity_magnitude, kinetic_energy, time) at a given downrange distance
+/// from a full-solver `TrajectoryResult.points` array. Same bracket-and-linear-interpolate
+/// logic as `TrajectoryResult::position_at_range`, extended to the additional per-point fields
+/// (`velocity_magnitude`/`kinetic_energy`/`time`) that method itself discards but the
+/// fast-path-shaped `TrajectoryOutput` needs (MBA-1295 Phase 3).
+fn point_at_range(points: &[RustTrajectoryPoint], target_range: f64) -> Option<(f64, f64, f64, f64, f64)> {
+    if points.is_empty() {
+        return None;
+    }
+    for i in 0..points.len() - 1 {
+        let p1 = &points[i];
+        let p2 = &points[i + 1];
+        if p1.position.x <= target_range && p2.position.x >= target_range {
+            let dx = p2.position.x - p1.position.x;
+            if dx.abs() < 1e-10 {
+                return Some((p1.position.y, p1.position.z, p1.velocity_magnitude, p1.kinetic_energy, p1.time));
+            }
+            let t = (target_range - p1.position.x) / dx;
+            let y = p1.position.y + t * (p2.position.y - p1.position.y);
+            let z = p1.position.z + t * (p2.position.z - p1.position.z);
+            let vel = p1.velocity_magnitude + t * (p2.velocity_magnitude - p1.velocity_magnitude);
+            let energy = p1.kinetic_energy + t * (p2.kinetic_energy - p1.kinetic_energy);
+            let time = p1.time + t * (p2.time - p1.time);
+            return Some((y, z, vel, energy, time));
+        }
+    }
+    points
+        .last()
+        .map(|p| (p.position.y, p.position.z, p.velocity_magnitude, p.kinetic_energy, p.time))
+}
+
+/// Evaluate one Monte Carlo sample via the full `TrajectorySolver` (MBA-1295 Phase 3), instead
+/// of the lean `solve_trajectory_for_monte_carlo` kernel. `ri` must already be SI-canonical and
+/// have passed through `mc_inputs_to_si` (bore-relative datum: sight_height/muzzle_height/
+/// target_height all zeroed), matching the fast path's own precondition exactly, so the
+/// resulting `drop`/`wind_drift` carry the SAME bore-relative semantics either way.
+///
+/// Builds `WindConditions`/`AtmosphericConditions` from `ri`'s own fields the same way
+/// `auto_zero_inputs`/`run_monte_carlo` do (this crate has no separate wind/atmo channel at the
+/// `monte_carlo_parallel` boundary — callers vary wind/atmosphere by sampling the relevant
+/// `BallisticInputs` fields directly), solves, and reads the interpolated point at the target
+/// distance -- mirroring what `solve_trajectory_for_monte_carlo` returns so the downstream
+/// CEP/percentile code (which only knows about `TrajectoryOutput`) is untouched.
+fn solve_via_full_solver(ri: &RustBallisticInputs) -> Option<TrajectoryOutput> {
+    let target_distance_m = ri.target_distance;
+    if !(target_distance_m.is_finite() && target_distance_m > 0.0) {
+        return None;
+    }
+
+    let wind = RustWindConditions {
+        speed: ri.wind_speed,
+        direction: ri.wind_angle,
+        vertical_speed: 0.0,
+    };
+    let atmosphere = RustAtmosphericConditions {
+        temperature: ri.temperature,
+        pressure: ri.pressure,
+        humidity: ri.humidity_percent(),
+        altitude: ri.altitude,
+    };
+
+    // Mirrors run_monte_carlo_with_wind_and_direction_std_dev's own solver_max_range: give the
+    // solver enough room to reach a long target distance (its own default max_range is a fixed
+    // 1000 m, too short for e.g. a 1500 yd sample).
+    let solver_max_range = target_distance_m.max(1000.0) * 2.0;
+    let mut solver = RustTrajectorySolver::new(ri.clone(), wind, atmosphere);
+    solver.set_max_range(solver_max_range);
+
+    let result = solver.solve().ok()?;
+
+    // Mirror solve_trajectory_for_monte_carlo's reachability gate: exclude samples that fell
+    // short of the target distance rather than silently reporting a too-short impact at the
+    // target downrange, which would poison mean/stddev/CEP aggregation.
+    if result.max_range < target_distance_m * 0.999 {
+        return None;
+    }
+
+    let (final_y, final_z, final_vel, final_energy, final_time) =
+        point_at_range(&result.points, target_distance_m)?;
+
+    // Same atmosphere resolution solve_trajectory_for_monte_carlo uses, so `mach` here matches
+    // the fast path's for identical inputs.
+    let (resolved_temp_c, resolved_pressure_hpa) =
+        resolve_station_conditions(ri.temperature, ri.pressure, ri.altitude);
+    let (_air_density, speed_of_sound) = calculate_atmosphere(
+        ri.altitude,
+        Some(resolved_temp_c),
+        Some(resolved_pressure_hpa),
+        ri.humidity_percent(),
+    );
+    let mach = final_vel / speed_of_sound;
+
+    // line_of_sight_y = muzzle_height + sight_height, both zeroed by mc_inputs_to_si -- matches
+    // solve_trajectory_for_monte_carlo's own `drop = line_of_sight_y - final_y` exactly.
+    let line_of_sight_y = ri.muzzle_height + ri.sight_height;
+    let drop = line_of_sight_y - final_y;
+
+    // TrajectorySolver::solve() already bakes the Litz spin-drift post-process into every
+    // point's position.z (cli_api::apply_spin_drift), so `final_z` above already includes it --
+    // same as the fast path's `final_lateral`. Recompute the isolated component for the
+    // reported `spin_drift` field only, with the SAME muzzle Sg (not used by
+    // CEP/percentile/dispersion, informational only).
+    let spin_drift_m = if ri.use_enhanced_spin_drift {
+        let sg = effective_sg_from_inputs(ri, resolved_temp_c, resolved_pressure_hpa);
+        litz_drift_meters(sg, final_time, ri.is_twist_right)
+    } else {
+        0.0
+    };
+
+    Some(TrajectoryOutput {
+        drop,
+        wind_drift: final_z,
+        time: final_time,
+        velocity: final_vel,
+        energy: final_energy,
+        mach,
+        spin_drift: spin_drift_m,
+        distance: target_distance_m,
+    })
+}
+
+/// `use_full_solver` (MBA-1295 Phase 3, default `false`): when true, each sample is evaluated
+/// via the full `ballistics_engine::TrajectorySolver` (`solve_via_full_solver`) instead of the
+/// lean `solve_trajectory_for_monte_carlo` kernel -- the same solver `/v1/calculate` uses, so
+/// this closes the last cross-solver divergence between the two live routes. Both paths share
+/// `apply_parameter` + `mc_inputs_to_si`, so the sampling contract, unit conversions, and
+/// bore-relative drop datum are IDENTICAL either way; only the per-sample physics kernel
+/// differs, and the two agree closely in practice (~0.02% mean-drop delta measured on the
+/// Flask smoke inputs). `hit_radius_m` (default `DEFAULT_HIT_RADIUS_M`) sizes the additive
+/// `hit_probability` output (see below).
+///
+/// PERF NOTE: measured at ~6.5-7.2x the fast path's wall time for 1000 samples (perf_mba1295_
+/// phase3.py; both still comfortably under the 20s absolute gate -- e.g. 0.29s vs 0.04s). This
+/// exceeds the Phase 3 perf gate's 3x-relative threshold, so the default here is `false`
+/// (opt in explicitly) rather than the originally-planned `true`; see
+/// perf_mba1295_phase3.py and the Phase 3 report for the numbers.
 #[pyfunction]
-#[pyo3(signature = (base_inputs, param_samples, param_names, num_threads=None, include_dispersion=true, max_viz_points=500))]
+#[pyo3(signature = (base_inputs, param_samples, param_names, num_threads=None, include_dispersion=true, max_viz_points=500, use_full_solver=false, hit_radius_m=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn monte_carlo_parallel<'py>(
     py: Python<'py>,
@@ -94,6 +236,8 @@ pub fn monte_carlo_parallel<'py>(
     num_threads: Option<usize>,
     include_dispersion: bool,
     max_viz_points: usize,
+    use_full_solver: bool,
+    hit_radius_m: Option<f64>,
 ) -> PyResult<Bound<'py, PyDict>> {
     // Honor num_threads via a scoped pool (0 -> error, mirroring ballistics_rust's
     // configure_thread_pool); None -> default global pool.
@@ -128,7 +272,11 @@ pub fn monte_carlo_parallel<'py>(
                     }
                 }
                 mc_inputs_to_si(&mut ri);
-                solve_trajectory_for_monte_carlo(&ri).ok()
+                if use_full_solver {
+                    solve_via_full_solver(&ri)
+                } else {
+                    solve_trajectory_for_monte_carlo(&ri).ok()
+                }
             })
             .collect::<Vec<_>>()
     };
@@ -189,9 +337,37 @@ pub fn monte_carlo_parallel<'py>(
         let (cx, cy, w, h, rot) = calculate_confidence_ellipse(&wd, &dr);
         let pts = sample_points_for_visualization(&wd, &dr, max_viz_points);
 
+        // Additive (MBA-1295 Phase 3): hit_probability + target_plane_cep, mirroring the
+        // engine's own MonteCarloResults::hit_probability/target_plane_cep semantics as closely
+        // as this function's data shape allows. Unlike MonteCarloResults (which sentinel-encodes
+        // every sample, including target shortfalls, as a deviation Vector3), this function
+        // already drops samples that failed or fell short of the target from `valid` -- they
+        // only show up via `metadata.failed_runs`/`success_rate`. `radial_miss` below is the
+        // distance from the point of aim (drop_m=0, wind_drift_m=0 -- the bore-relative LOS
+        // origin `mc_inputs_to_si` establishes), NOT from the sample mean (that's `cep_m`
+        // above, which is group-size / precision only and ignores any systematic bias). The
+        // hit_probability denominator is `n_samples` (every attempted sample, matching the
+        // engine's inclusive convention: failed/short-of-target samples count as misses, not
+        // as excluded trials).
+        let radial_miss: Vec<f64> = wd.iter().zip(dr.iter()).map(|(x, y)| (x * x + y * y).sqrt()).collect();
+        let hit_radius = hit_radius_m.unwrap_or(DEFAULT_HIT_RADIUS_M);
+        let hits = radial_miss.iter().filter(|m| **m <= hit_radius).count();
+        let hit_probability = if n_samples > 0 {
+            hits as f64 / n_samples as f64
+        } else {
+            0.0
+        };
+        let mut sorted_radial_miss = radial_miss.clone();
+        sorted_radial_miss.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let target_plane_cep_m = percentile(&sorted_radial_miss, 0.50);
+
         let disp = PyDict::new(py);
         disp.set_item("cep_m", cep)?;
         disp.set_item("cep_inches", cep * M_TO_INCHES)?;
+        disp.set_item("hit_probability", hit_probability)?;
+        disp.set_item("hit_radius_m", hit_radius)?;
+        disp.set_item("target_plane_cep_m", target_plane_cep_m)?;
+        disp.set_item("target_plane_cep_inches", target_plane_cep_m * M_TO_INCHES)?;
         let el = PyDict::new(py);
         el.set_item("center_x_m", cx)?;
         el.set_item("center_y_m", cy)?;
