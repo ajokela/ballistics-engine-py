@@ -101,6 +101,9 @@ impl PyWindConditions {
         RustWindConditions {
             speed: self.speed_mph * MPH_TO_MPS,
             direction: self.direction_degrees * DEGREES_TO_RADIANS,
+            // ballistics-engine 0.24.0 added vertical_speed (MBA-728); PyWindConditions has no
+            // Python-facing vertical-wind field, so leave it at the engine default (0.0).
+            ..Default::default()
         }
     }
 }

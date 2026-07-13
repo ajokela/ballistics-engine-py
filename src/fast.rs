@@ -12,6 +12,7 @@ use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use ::ballistics_engine::drag::DragTable;
+use ::ballistics_engine::wind::WindSegment;
 use ::ballistics_engine::{BCSegmentData, BallisticInputs as RustBallisticInputs, DragModel};
 
 const GRAINS_TO_KG: f64 = 0.00006479891;
@@ -24,6 +25,19 @@ fn wind_segments_kmh_to_mps(segments: Vec<(f64, f64, f64)>) -> Vec<(f64, f64, f6
         .map(|(speed_kmh, angle_deg, until_distance_m)| {
             (speed_kmh * KMH_TO_MPS, angle_deg, until_distance_m)
         })
+        .collect()
+}
+
+/// Convert the Python-facing (speed_kmh, angle_deg, until_distance_m) tuples into the
+/// engine's `wind::WindSegment` struct (engine 0.24.0 boundary change: `WindSock`,
+/// `TrajectorySolver::set_wind_segments`, and `fast_integrate_with_segments` now take
+/// `Vec<WindSegment>` instead of tuples). `WindShearWindSock` still takes raw
+/// `(speed_mps, angle_deg, until_m)` tuples, so `wind_segments_kmh_to_mps` above is
+/// unaffected and keeps returning tuples for that path.
+fn to_wind_segments(segments: Vec<(f64, f64, f64)>) -> Vec<WindSegment> {
+    segments
+        .into_iter()
+        .map(|(speed_kmh, angle_deg, until_m)| WindSegment::new(speed_kmh, angle_deg, until_m))
         .collect()
 }
 
@@ -302,7 +316,7 @@ pub fn fast_integrate<'py>(
         atmo_sock,
     };
 
-    let solution = fast_integrate_with_segments(&bi, wind_segments, params);
+    let solution = fast_integrate_with_segments(&bi, to_wind_segments(wind_segments), params);
 
     let dict = PyDict::new(py);
     dict.set_item("t", PyArray1::from_vec(py, solution.t))?;
@@ -384,7 +398,7 @@ pub fn derivatives<'py>(
         );
         sock.vector_for_position(pos)
     } else {
-        let sock = WindSock::new(wind_segments);
+        let sock = WindSock::new(to_wind_segments(wind_segments));
         sock.vector_for_range_stateless(pos[0])
     };
 
@@ -443,6 +457,9 @@ pub fn calculate_zero_angle(
     let wind = WindConditions {
         speed: wind_speed_mph * 0.44704, // mph -> m/s
         direction: wind_direction_deg.to_radians(),
+        // ballistics-engine 0.24.0 added vertical_speed (MBA-728); this entry point has no
+        // vertical-wind input, so leave it at the engine default (0.0).
+        ..Default::default()
     };
     let atmosphere = AtmosphericConditions {
         temperature: (temperature_f - 32.0) * 5.0 / 9.0, // F -> C
@@ -476,7 +493,8 @@ mod tests {
     fn shear_and_uniform_wind_segments_share_the_kmh_contract() {
         let segments = vec![(36.0, 90.0, 1_000.0)];
 
-        let uniform = WindSock::new(segments.clone()).vector_for_range_stateless(100.0);
+        let uniform =
+            WindSock::new(to_wind_segments(segments.clone())).vector_for_range_stateless(100.0);
         let shear = WindShearWindSock::new(wind_segments_kmh_to_mps(segments), None)
             .vector_for_position(Vector3::new(100.0, 0.0, 0.0));
 
