@@ -216,3 +216,115 @@ pub fn monte_carlo_parallel<'py>(
 
     Ok(out)
 }
+
+/// Wraps the engine's own `run_monte_carlo_with_wind_and_direction_std_dev` (MBA-1295):
+/// parses `inputs` through the SAME shared rich dict parser as `PyBallisticInputs::from_dict`
+/// / `auto_zero_inputs`, runs the engine's Monte Carlo driver (which internally re-solves a
+/// full `TrajectorySolver` per sample — distinct from `monte_carlo_parallel` above, which
+/// takes pre-sampled parameter rows over the lighter-weight `solve_trajectory_for_monte_carlo`
+/// kernel), and returns a dict exposing `MonteCarloResults`' raw per-sample data plus
+/// `hit_probability` and `target_plane_cep`.
+///
+/// `params` mirrors `MonteCarloParams` field-for-field in the ENGINE's own SI units:
+/// `num_simulations` (int), `velocity_std_dev` (m/s), `angle_std_dev`/`azimuth_std_dev`
+/// (radians), `bc_std_dev` (BC units), `wind_speed_std_dev` (m/s), `target_distance`
+/// (meters, optional — defaults to the baseline solve's max range), `base_wind_speed`/
+/// `base_wind_direction` (currently unused by the wrapped engine function — accepted for
+/// forward compatibility), plus `wind_direction_std_dev` (radians; a separate argument on
+/// the wrapped engine function, not a `MonteCarloParams` field).
+///
+/// `wind`/`atmo` override the inputs dict's own `wind_speed`/`wind_angle` and
+/// `temperature`/`pressure`/`humidity`/`altitude` (the engine function derives its
+/// atmosphere from the inputs struct, not a separate parameter, so this is the only channel
+/// for supplying atmosphere here — matching `auto_zero_inputs`).
+#[pyfunction]
+#[pyo3(signature = (inputs, params, wind=None, atmo=None, hit_radius_m=None))]
+pub fn run_monte_carlo<'py>(
+    py: Python<'py>,
+    inputs: &Bound<'py, PyDict>,
+    params: &Bound<'py, PyDict>,
+    wind: Option<crate::PyWindConditions>,
+    atmo: Option<crate::PyAtmosphericConditions>,
+    hit_radius_m: Option<f64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    use ::ballistics_engine::{
+        run_monte_carlo_with_wind_and_direction_std_dev, MonteCarloParams,
+        WindConditions as RustWindConditions, DEFAULT_HIT_RADIUS_M,
+    };
+
+    let mut bi = crate::inputs::ballistic_inputs_from_dict(inputs)?;
+    crate::inputs::full_to_si(&mut bi);
+
+    if let Some(a) = &atmo {
+        let r = a.to_rust();
+        bi.temperature = r.temperature;
+        bi.pressure = r.pressure;
+        bi.humidity = r.humidity / 100.0; // AtmosphericConditions.humidity is percent
+        bi.altitude = r.altitude;
+    }
+
+    let base_wind = wind.map(|w| w.to_rust()).unwrap_or(RustWindConditions {
+        speed: bi.wind_speed,
+        direction: bi.wind_angle,
+        vertical_speed: 0.0,
+    });
+
+    let g = |k: &str, d: f64| -> PyResult<f64> {
+        Ok(match params.get_item(k)? {
+            Some(v) if !v.is_none() => v.extract()?,
+            _ => d,
+        })
+    };
+    let num_simulations: usize = match params.get_item("num_simulations")? {
+        Some(v) if !v.is_none() => v.extract()?,
+        _ => 1000,
+    };
+    let target_distance: Option<f64> = match params.get_item("target_distance")? {
+        Some(v) if !v.is_none() => Some(v.extract()?),
+        _ => None,
+    };
+    let mc_params = MonteCarloParams {
+        num_simulations,
+        velocity_std_dev: g("velocity_std_dev", 1.0)?,
+        angle_std_dev: g("angle_std_dev", 0.001)?,
+        bc_std_dev: g("bc_std_dev", 0.01)?,
+        wind_speed_std_dev: g("wind_speed_std_dev", 1.0)?,
+        target_distance,
+        base_wind_speed: g("base_wind_speed", 0.0)?,
+        base_wind_direction: g("base_wind_direction", 0.0)?,
+        azimuth_std_dev: g("azimuth_std_dev", 0.001)?,
+    };
+    let wind_direction_std_dev = g("wind_direction_std_dev", 0.001)?;
+
+    let results = run_monte_carlo_with_wind_and_direction_std_dev(
+        bi,
+        base_wind,
+        mc_params,
+        wind_direction_std_dev,
+    )
+    .map_err(|e| PyValueError::new_err(format!("Monte Carlo run failed: {e}")))?;
+
+    let radius = hit_radius_m.unwrap_or(DEFAULT_HIT_RADIUS_M);
+    let hit_probability = results.hit_probability(radius);
+    let target_plane_cep_m = results.target_plane_cep();
+    let target_arrival_count = results.target_arrival_count();
+    let target_shortfall_fraction = results.target_shortfall_fraction();
+    let num_samples = results.impact_positions.len();
+    let impact_positions_yz_m: Vec<(f64, f64)> = results
+        .impact_positions
+        .iter()
+        .map(|p| (p.y, p.z))
+        .collect();
+
+    let out = PyDict::new(py);
+    out.set_item("hit_probability", hit_probability)?;
+    out.set_item("hit_radius_m", radius)?;
+    out.set_item("target_plane_cep_m", target_plane_cep_m)?;
+    out.set_item("target_arrival_count", target_arrival_count)?;
+    out.set_item("target_shortfall_fraction", target_shortfall_fraction)?;
+    out.set_item("num_samples", num_samples)?;
+    out.set_item("ranges_m", results.ranges)?;
+    out.set_item("impact_velocities_mps", results.impact_velocities)?;
+    out.set_item("impact_positions_yz_m", impact_positions_yz_m)?;
+    Ok(out)
+}

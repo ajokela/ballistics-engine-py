@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""MBA-1295 Phase 1 coverage: the extended BallisticInputs dict parser, the new
+TrajectorySolver setters, WindConditions.vertical_speed_mps, TrajectoryResult sampling
+passthrough, auto_zero_inputs, and run_monte_carlo.
+
+Plain-python smoke test (no pytest dependency), matching this repo's existing
+test_bindings.py convention. Run via:
+
+    maturin develop --release   # or install the built wheel
+    python test_mba1295.py
+"""
+import math
+import sys
+import traceback
+
+from ballistics_engine import (
+    AtmosphericConditions,
+    BallisticInputs,
+    DragModel,
+    TrajectorySolver,
+    WindConditions,
+    auto_zero_inputs,
+    run_monte_carlo,
+)
+
+FAILURES = []
+
+
+def check(name, condition, detail=""):
+    if condition:
+        print(f"  ok: {name}")
+    else:
+        msg = f"FAIL: {name} {detail}".rstrip()
+        print(f"  {msg}")
+        FAILURES.append(msg)
+
+
+def yz_at(points, x_target):
+    """Interpolate (y, z) yards at downrange distance x_target yards."""
+    for i in range(1, len(points)):
+        if points[i].x >= x_target:
+            p1, p2 = points[i - 1], points[i]
+            dx = p2.x - p1.x
+            t = 0.0 if abs(dx) < 1e-12 else (x_target - p1.x) / dx
+            y = p1.y + t * (p2.y - p1.y)
+            z = p1.z + t * (p2.z - p1.z)
+            return y, z
+    raise AssertionError(f"trajectory never reached x={x_target}yd")
+
+
+BASE_DICT = {
+    "bc": 0.5,
+    "drag_model": "G7",
+    "bullet_weight_grains": 168.0,
+    "muzzle_velocity_fps": 2625.0,  # ~800 m/s
+    "bullet_diameter_inches": 0.308,
+    "bullet_length_inches": 1.2,
+    "sight_height_inches": 1.97,  # ~0.05 m
+    "twist_rate_inches": 10.0,
+    "zero_distance_yards": 100.0,
+}
+
+
+def solver_from_dict(d, wind=None, atmo=None, max_range_m=500.0):
+    inputs = BallisticInputs.from_dict(d)
+    s = TrajectorySolver(inputs, wind=wind, atmosphere=atmo)
+    s.set_max_range(max_range_m)
+    return s
+
+
+# ---------------------------------------------------------------------------
+
+
+def test_backward_compat_legacy_from_dict():
+    print("test_backward_compat_legacy_from_dict")
+    # Every key that worked before (test_bindings.py's 11-key style) must still parse.
+    d = dict(BASE_DICT)
+    inputs = BallisticInputs.from_dict(d)
+    check("bc round-trips", inputs.bc == 0.5, f"got {inputs.bc}")
+    check(
+        "bullet_weight_grains round-trips",
+        abs(inputs.bullet_weight_grains - 168.0) < 1e-9,
+    )
+    check(
+        "muzzle_velocity_fps round-trips",
+        abs(inputs.muzzle_velocity_fps - 2625.0) < 1e-6,
+    )
+    check("is_right_twist defaults true", inputs.is_right_twist is True)
+    repr(inputs)  # must not raise
+
+    # Missing keys fall back to the documented constructor defaults.
+    empty = BallisticInputs.from_dict({})
+    ctor_default = BallisticInputs()
+    check(
+        "empty-dict bc matches constructor default",
+        empty.bc == ctor_default.bc,
+        f"{empty.bc} vs {ctor_default.bc}",
+    )
+    check(
+        "empty-dict muzzle_velocity_fps matches constructor default",
+        abs(empty.muzzle_velocity_fps - ctor_default.muzzle_velocity_fps) < 1e-6,
+    )
+
+    s = TrajectorySolver(inputs)
+    s.set_max_range(500.0)
+    result = s.solve()
+    check("legacy-keyed dict solves", result.time_of_flight > 0)
+
+
+def test_new_properties_roundtrip():
+    print("test_new_properties_roundtrip")
+    i = BallisticInputs()
+    i.cant_angle_degrees = 10.0
+    check("cant_angle_degrees round-trips", abs(i.cant_angle_degrees - 10.0) < 1e-9)
+
+    i.enable_trajectory_sampling = True
+    check("enable_trajectory_sampling round-trips", i.enable_trajectory_sampling is True)
+
+    i.sample_interval_m = 25.0
+    check("sample_interval_m round-trips", abs(i.sample_interval_m - 25.0) < 1e-9)
+
+    i.use_rk4 = False
+    check("use_rk4 round-trips", i.use_rk4 is False)
+    i.use_adaptive_rk45 = True
+    check("use_adaptive_rk45 round-trips", i.use_adaptive_rk45 is True)
+
+    i.muzzle_height_inches = 2.0
+    check("muzzle_height_inches round-trips", abs(i.muzzle_height_inches - 2.0) < 1e-9)
+    i.target_height_inches = 3.0
+    check("target_height_inches round-trips", abs(i.target_height_inches - 3.0) < 1e-9)
+
+
+def test_rich_keys_parse_on_solver_path():
+    print("test_rich_keys_parse_on_solver_path")
+    d = dict(BASE_DICT)
+    d.update({
+        "cant_angle_degrees": 0.0,
+        "enable_trajectory_sampling": False,
+        "use_rk4": True,
+        "use_adaptive_rk45": False,
+        "enable_coriolis": False,
+    })
+    inputs = BallisticInputs.from_dict(d)
+    check("use_rk4 parsed from dict", inputs.use_rk4 is True)
+    check("use_adaptive_rk45 parsed from dict", inputs.use_adaptive_rk45 is False)
+    s = TrajectorySolver(inputs)
+    s.set_max_range(500.0)
+    result = s.solve()
+    check("rich-keyed dict solves", result.time_of_flight > 0)
+
+
+def test_cant_tilts_poi_right_and_low():
+    print("test_cant_tilts_poi_right_and_low")
+    # ~0.003 rad (~10 MOA) up, matching the engine's own
+    # cant_sign_clockwise_up_offset_goes_right_and_low unit test.
+    muzzle_angle_deg = math.degrees(0.003)
+
+    level_dict = dict(BASE_DICT)
+    level_dict["muzzle_angle"] = muzzle_angle_deg
+    level = solver_from_dict(level_dict, max_range_m=500.0).solve()
+
+    canted_dict = dict(level_dict)
+    canted_dict["cant_angle_degrees"] = 10.0
+    canted = solver_from_dict(canted_dict, max_range_m=500.0).solve()
+
+    y0, z0 = yz_at(level.points, 300.0)
+    y1, z1 = yz_at(canted.points, 300.0)
+    check("clockwise cant moves POI right (+z)", z1 > z0 + 0.01, f"z0={z0} z1={z1}")
+    check("clockwise cant moves POI low (-y)", y1 < y0 - 0.001, f"y0={y0} y1={y1}")
+
+
+def test_vertical_wind_raises_poi():
+    print("test_vertical_wind_raises_poi")
+    d = dict(BASE_DICT)
+    calm = solver_from_dict(d, wind=WindConditions(0.0, 0.0, 0.0), max_range_m=500.0).solve()
+    updraft = solver_from_dict(
+        d, wind=WindConditions(0.0, 0.0, 5.0), max_range_m=500.0
+    ).solve()
+
+    y_calm, _ = yz_at(calm.points, 400.0)
+    y_updraft, _ = yz_at(updraft.points, 400.0)
+    check(
+        "5 m/s updraft raises POI at 400yd",
+        y_updraft > y_calm,
+        f"calm={y_calm} updraft={y_updraft}",
+    )
+
+
+def test_custom_drag_table_changes_drop():
+    print("test_custom_drag_table_changes_drop")
+    d = dict(BASE_DICT)
+    baseline = solver_from_dict(d, max_range_m=500.0).solve()
+
+    dragged_dict = dict(d)
+    # Flat, much higher Cd than G7 across the whole Mach range -> far more drag.
+    # JSON-shaped list-of-lists, matching what a Flask/JSON caller actually sends.
+    dragged_dict["custom_drag_table"] = [[0.3, 1.0], [1.0, 1.0], [2.0, 1.0], [3.5, 1.0]]
+    dragged = solver_from_dict(dragged_dict, max_range_m=500.0).solve()
+
+    y_base, _ = yz_at(baseline.points, 150.0)
+    y_drag, _ = yz_at(dragged.points, 150.0)
+    check(
+        "custom_drag_table with much higher Cd increases drop at 150yd",
+        y_drag < y_base - 0.02,
+        f"baseline={y_base} dragged={y_drag}",
+    )
+
+    bad_dict = dict(d)
+    bad_dict["custom_drag_table"] = [[1.0, 0.3]]  # only 1 point -> invalid
+    raised = False
+    try:
+        BallisticInputs.from_dict(bad_dict)
+    except ValueError:
+        raised = True
+    check("malformed custom_drag_table raises ValueError", raised)
+
+
+def test_trajectory_sampling_returns_rows():
+    print("test_trajectory_sampling_returns_rows")
+    d = dict(BASE_DICT)
+    d["enable_trajectory_sampling"] = True
+    d["sample_interval_m"] = 50.0
+    result = solver_from_dict(d, max_range_m=500.0).solve()
+
+    check("sampled_points is populated", result.sampled_points is not None)
+    if result.sampled_points is not None:
+        check("sampled_points has rows", len(result.sampled_points) >= 2)
+        row = result.sampled_points[0]
+        for key in ("distance_m", "drop_m", "wind_drift_m", "velocity_mps", "energy_j", "time_s", "flags"):
+            check(f"sample row has {key}", key in row, f"keys={list(row.keys())}")
+        check("flags is a list", isinstance(row["flags"], list))
+
+    # Sampling off (default) -> None.
+    d_off = dict(BASE_DICT)
+    result_off = solver_from_dict(d_off, max_range_m=500.0).solve()
+    check("sampled_points is None when sampling disabled", result_off.sampled_points is None)
+
+
+def test_four_tuple_wind_segment_parses():
+    print("test_four_tuple_wind_segment_parses")
+    d = dict(BASE_DICT)
+    inputs = BallisticInputs.from_dict(d)
+    s = TrajectorySolver(inputs)
+    s.set_max_range(500.0)
+    # 3-tuple and 4-tuple (with vertical_mps) in the same call.
+    s.set_wind_segments([(20.0, 90.0, 200.0), (15.0, 90.0, 1000.0, 3.0)])
+    result = s.solve()
+    check("solve succeeds with mixed 3/4-tuple wind segments", result.time_of_flight > 0)
+    _, z_far = yz_at(result.points, 400.0)
+    check("segmented crosswind produces nonzero windage", abs(z_far) > 0.01, f"z={z_far}")
+
+
+def test_atmo_segments_accepted():
+    print("test_atmo_segments_accepted")
+    d = dict(BASE_DICT)
+    inputs = BallisticInputs.from_dict(d)
+    s = TrajectorySolver(inputs)
+    s.set_max_range(500.0)
+    s.set_atmo_segments([(20.0, 1000.0, 50.0, 200.0), (0.0, 1013.25, 50.0, 1000.0)])
+    result = s.solve()
+    check("solve succeeds with atmo segments", result.time_of_flight > 0)
+    s.set_atmo_segments([])  # clears back to single-station; must not raise
+    result2 = s.solve()
+    check("clearing atmo segments still solves", result2.time_of_flight > 0)
+
+
+def test_auto_zero_then_solve_lands_near_sight_line():
+    print("test_auto_zero_then_solve_lands_near_sight_line")
+    d = dict(BASE_DICT)
+    d["zero_distance_yards"] = 200.0
+
+    unzeroed = solver_from_dict(d, max_range_m=500.0).solve()
+    y_unzeroed, _ = yz_at(unzeroed.points, 200.0)
+
+    muzzle_angle_rad = auto_zero_inputs(d, 200.0)
+    check("auto_zero_inputs returns a finite angle", math.isfinite(muzzle_angle_rad))
+    check("auto_zero_inputs returns a positive (up) angle", muzzle_angle_rad > 0.0)
+
+    zeroed_dict = dict(d)
+    zeroed_dict["muzzle_angle"] = math.degrees(muzzle_angle_rad)
+    zeroed = solver_from_dict(zeroed_dict, max_range_m=500.0).solve()
+    y_zeroed, _ = yz_at(zeroed.points, 200.0)
+
+    check(
+        "zeroed POI is much closer to the sight line at zero distance than unzeroed",
+        abs(y_zeroed) < abs(y_unzeroed) * 0.1,
+        f"y_unzeroed={y_unzeroed} y_zeroed={y_zeroed}",
+    )
+
+
+def test_run_monte_carlo_hit_probability():
+    print("test_run_monte_carlo_hit_probability")
+    d = dict(BASE_DICT)
+    d["zero_distance_yards"] = 100.0
+    params = {
+        "num_simulations": 40,
+        "velocity_std_dev": 5.0,
+        "angle_std_dev": 0.0005,
+        "bc_std_dev": 0.005,
+        "wind_speed_std_dev": 0.5,
+        "wind_direction_std_dev": 0.05,
+        "target_distance": 100.0 * 0.9144,
+    }
+    out = run_monte_carlo(d, params)
+    check("hit_probability present", "hit_probability" in out)
+    hp = out["hit_probability"]
+    check("hit_probability in [0, 1]", 0.0 <= hp <= 1.0, f"hp={hp}")
+    check("num_samples > 0", out["num_samples"] > 0, f"num_samples={out['num_samples']}")
+    check(
+        "ranges_m length matches num_samples",
+        len(out["ranges_m"]) == out["num_samples"],
+    )
+    cep = out["target_plane_cep_m"]
+    check("target_plane_cep_m is None or non-negative float", cep is None or cep >= 0.0)
+
+
+def main():
+    tests = [
+        test_backward_compat_legacy_from_dict,
+        test_new_properties_roundtrip,
+        test_rich_keys_parse_on_solver_path,
+        test_cant_tilts_poi_right_and_low,
+        test_vertical_wind_raises_poi,
+        test_custom_drag_table_changes_drop,
+        test_trajectory_sampling_returns_rows,
+        test_four_tuple_wind_segment_parses,
+        test_atmo_segments_accepted,
+        test_auto_zero_then_solve_lands_near_sight_line,
+        test_run_monte_carlo_hit_probability,
+    ]
+    for t in tests:
+        try:
+            t()
+        except Exception:
+            print(f"  EXCEPTION in {t.__name__}:")
+            traceback.print_exc()
+            FAILURES.append(f"{t.__name__} raised an exception")
+
+    print()
+    if FAILURES:
+        print(f"FAILED: {len(FAILURES)} check(s) failed")
+        for f in FAILURES:
+            print(f"  - {f}")
+        sys.exit(1)
+    else:
+        print("All MBA-1295 checks passed.")
+
+
+if __name__ == "__main__":
+    main()
