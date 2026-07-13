@@ -434,8 +434,11 @@ pub(crate) fn ballistic_inputs_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Rust
         enable_trajectory_sampling: opt!("enable_trajectory_sampling", false),
         sample_interval: f64_field(d, "sample_interval", Some("sample_interval_m"), 10.0)?,
         // MBA-1295: previously hardcoded 0.0 regardless of dict content, so sight/muzzle/
-        // target heights were silently unsettable on the fast path.
-        sight_height: f64_field(d, "sight_height", Some("sight_height_inches"), 0.0)?,
+        // target heights were silently unsettable on the fast path. sight_height keeps the
+        // legacy PyBallisticInputs missing-key default of 1.5 INCHES (review fix — the
+        // Phase 1 first cut regressed it to 0.0); monte_carlo_parallel re-zeroes all three
+        // datum fields at its own boundary to stay bore-relative (see mc_inputs_to_si).
+        sight_height: f64_field(d, "sight_height", Some("sight_height_inches"), 1.5)?,
         muzzle_height: f64_field(d, "muzzle_height", Some("muzzle_height_inches"), 0.0)?,
         target_height: f64_field(d, "target_height", Some("target_height_inches"), 0.0)?,
         // MBA-1295: rifle cant, degrees pre-SI (converted to radians by `full_to_si`); no

@@ -66,7 +66,16 @@ fn mc_inputs_to_si(i: &mut RustBallisticInputs) {
     i.target_distance *= 0.9144; // yards -> m
     i.muzzle_velocity *= 0.3048; // fps -> m/s
     i.altitude *= 0.3048; // feet -> m
-    i.sight_height *= 0.0254; // inches -> m
+    // MBA-1295 review: the shared parser now populates sight_height (and can populate
+    // muzzle_height / target_height) from the dict, but the pre-MBA-1295 fast-path parser
+    // hardcoded all three to 0.0, and the engine's solve_trajectory_for_monte_carlo computes
+    // drop = (muzzle_height + sight_height) - final_y. Pre-MBA-1295 MC drop is therefore
+    // BORE-relative; switching it to sight-relative is a deliberate later-phase decision
+    // that must go through the golden ledger. Zero the datum fields at this boundary so
+    // Phase 1 stays behavior-preserving (do NOT change the shared parser).
+    i.sight_height = 0.0;
+    i.muzzle_height = 0.0;
+    i.target_height = 0.0;
     i.wind_speed *= 0.2777778; // km/h -> m/s
     i.wind_angle = i.wind_angle.to_radians(); // degrees -> radians
     i.muzzle_angle = i.muzzle_angle.to_radians(); // degrees -> radians

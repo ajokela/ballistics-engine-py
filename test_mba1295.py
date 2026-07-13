@@ -288,6 +288,88 @@ def test_auto_zero_then_solve_lands_near_sight_line():
     )
 
 
+def test_from_dict_missing_sight_height_defaults_to_1_5_inches():
+    """MBA-1295 review lock: the legacy from_dict documented a 1.5-inch default for
+    sight_height_inches; the shared parser must preserve it (0.0381 m internally)."""
+    print("test_from_dict_missing_sight_height_defaults_to_1_5_inches")
+    d = dict(BASE_DICT)
+    d.pop("sight_height_inches", None)
+    inputs = BallisticInputs.from_dict(d)
+    # The getter divides the internal SI meters by 0.0254, so 1.5 here implies the
+    # engine-side field carries exactly 1.5 * 0.0254 = 0.0381 m.
+    check(
+        "from_dict without sight_height_inches defaults to 1.5 in (0.0381 m)",
+        abs(inputs.sight_height_inches - 1.5) < 1e-12,
+        f"got {inputs.sight_height_inches}",
+    )
+    empty = BallisticInputs.from_dict({})
+    check(
+        "empty-dict sight_height_inches also defaults to 1.5",
+        abs(empty.sight_height_inches - 1.5) < 1e-12,
+        f"got {empty.sight_height_inches}",
+    )
+
+
+def test_monte_carlo_parallel_drop_is_bore_relative():
+    """MBA-1295 review lock: pre-MBA-1295 the fast-path parser hardcoded sight_height 0.0,
+    so monte_carlo_parallel drop has always been BORE-relative (engine kernel computes
+    drop = (muzzle_height + sight_height) - final_y). The shared parser now reads
+    sight_height from the dict, so monte_carlo_parallel must re-zero it at its own
+    boundary. This test FAILS if sight_height leaks in: a Flask-shaped dict with
+    sight_height 1.5 must produce mean drop identical to one with sight_height 0.0
+    (a leak would shift it by exactly 1.5 in = 0.0381 m)."""
+    print("test_monte_carlo_parallel_drop_is_bore_relative")
+    import numpy as np
+
+    from ballistics_engine import monte_carlo_parallel
+
+    # Flask-shaped MC dict (the imperial MC convention: fps/grains/yards/feet/km/h/deg/%).
+    flask_dict = {
+        "bc_value": 0.5,
+        "bc_type": "G7",
+        "bullet_mass": 168.0,
+        "altitude": 0.0,
+        "muzzle_velocity": 2650.0,
+        "target_distance": 300.0,
+        "twist_rate": 10.0,
+        "bullet_length": 1.2,
+        "bullet_diameter": 0.308,
+        "temperature": 15.0,
+        "pressure": 1013.25,
+        "humidity": 50.0,
+        "sight_height": 1.5,
+    }
+    samples = np.array([[0.5], [0.5]])  # 2 identical deterministic runs
+    names = ["bc_value"]
+
+    def mean_drop(d):
+        out = monte_carlo_parallel(d, samples, names)
+        assert out["metadata"]["valid_runs"] == 2, out["metadata"]
+        return out["statistics"]["drop_m"]["mean"]
+
+    drop_with_sight = mean_drop(flask_dict)
+
+    zeroed_dict = dict(flask_dict)
+    zeroed_dict["sight_height"] = 0.0
+    drop_zeroed = mean_drop(zeroed_dict)
+
+    absent_dict = dict(flask_dict)
+    del absent_dict["sight_height"]  # parser default (1.5) must ALSO be zeroed at MC boundary
+    drop_absent = mean_drop(absent_dict)
+
+    check(
+        "MC mean drop with sight_height 1.5 equals old (bore-relative) behavior",
+        abs(drop_with_sight - drop_zeroed) < 1e-12,
+        f"with={drop_with_sight} zeroed={drop_zeroed} (leak would differ by 0.0381)",
+    )
+    check(
+        "MC mean drop with sight_height absent equals old (bore-relative) behavior",
+        abs(drop_absent - drop_zeroed) < 1e-12,
+        f"absent={drop_absent} zeroed={drop_zeroed}",
+    )
+    check("MC mean drop is finite and positive at 300yd", drop_zeroed > 0.0, f"drop={drop_zeroed}")
+
+
 def test_run_monte_carlo_hit_probability():
     print("test_run_monte_carlo_hit_probability")
     d = dict(BASE_DICT)
@@ -326,6 +408,8 @@ def main():
         test_four_tuple_wind_segment_parses,
         test_atmo_segments_accepted,
         test_auto_zero_then_solve_lands_near_sight_line,
+        test_from_dict_missing_sight_height_defaults_to_1_5_inches,
+        test_monte_carlo_parallel_drop_is_bore_relative,
         test_run_monte_carlo_hit_probability,
     ]
     for t in tests:
