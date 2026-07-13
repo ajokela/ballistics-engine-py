@@ -210,7 +210,8 @@ fn solve_via_full_solver(ri: &RustBallisticInputs) -> Option<TrajectoryOutput> {
     })
 }
 
-/// `use_full_solver` (MBA-1295 Phase 3, default `false`): when true, each sample is evaluated
+/// `use_full_solver` (MBA-1295 Phase 3, default `true` — 1000 full-solver samples cost ~0.3 s
+/// absolute, well inside any request budget; the fast kernel remains as an opt-out): when true, each sample is evaluated
 /// via the full `ballistics_engine::TrajectorySolver` (`solve_via_full_solver`) instead of the
 /// lean `solve_trajectory_for_monte_carlo` kernel -- the same solver `/v1/calculate` uses, so
 /// this closes the last cross-solver divergence between the two live routes. Both paths share
@@ -226,7 +227,7 @@ fn solve_via_full_solver(ri: &RustBallisticInputs) -> Option<TrajectoryOutput> {
 /// (opt in explicitly) rather than the originally-planned `true`; see
 /// perf_mba1295_phase3.py and the Phase 3 report for the numbers.
 #[pyfunction]
-#[pyo3(signature = (base_inputs, param_samples, param_names, num_threads=None, include_dispersion=true, max_viz_points=500, use_full_solver=false, hit_radius_m=None))]
+#[pyo3(signature = (base_inputs, param_samples, param_names, num_threads=None, include_dispersion=true, max_viz_points=500, use_full_solver=true, hit_radius_m=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn monte_carlo_parallel<'py>(
     py: Python<'py>,
