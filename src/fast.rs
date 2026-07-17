@@ -187,7 +187,11 @@ pub fn derivatives<'py>(
         );
         sock.vector_for_position(pos)
     } else {
-        let sock = WindSock::new(to_wind_segments(wind_segments));
+        // MBA-1338: checked construction — malformed segments (non-finite / negative
+        // fields) now surface as a structured ValueError naming the segment index and
+        // field, instead of silently feeding a poisoned wind vector into the step.
+        let sock = WindSock::try_new(to_wind_segments(wind_segments))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
         sock.vector_for_range_stateless(pos[0])
     };
 
