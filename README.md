@@ -152,6 +152,52 @@ Drag model selection.
 - `DragModel.g7()`: G7 drag model (boat tail)
 - `DragModel.g8()`: G8 drag model (boat tail with meplat)
 
+### `bridge_call(request_json: str) -> str`
+
+The engine's versioned JSON command bridge: one request envelope in, one response
+envelope out, both as strings. It is a transport onto the engine's own service layer,
+so it reaches solve inputs that the typed classes above do not expose at all — among
+them `effects.wind_shear_model`, `corrections.bc5d_table_path` and
+`atmosphere.pressure_reference`.
+
+```python
+import json
+from ballistics_engine import bridge_call
+
+response = json.loads(bridge_call(json.dumps({
+    "api_version": 1,
+    "command": "solve",
+    "request": {
+        "schema_version": 1,
+        "projectile": {"mass_kg": 0.01134, "diameter_m": 0.00782, "length_m": 0.0338,
+                       "drag_model": "G7", "ballistic_coefficient": 0.243},
+        "rifle": {"muzzle_velocity_mps": 823.0, "sight_height_m": 0.0381},
+        "shot": {"max_range_m": 1000.0, "zero_distance_m": 100.0},
+        "atmosphere": {}, "wind": {"speed_mps": 4.47, "direction_from_rad": 1.5708},
+        "solver": {}, "effects": {"wind_shear_model": "logarithmic"},
+        "sampling": {"interval_m": 100.0},
+    },
+})))
+
+if response["ok"]:
+    print(response["result"]["samples"][-1])
+else:
+    print(response["error"]["code"], response["error"]["message"])
+```
+
+Unlike the rest of this API, **failures come back inside the returned JSON rather than
+as a Python exception** — a bad envelope, an unknown command or an invalid field all
+return a well-formed `{"ok": false, "api_version": 1, "engine_version": "...",
+"error": {"code": ..., "message": ...}}` document. The wrapper returns the string
+verbatim; parsing and error handling are the caller's.
+
+Unlike the classes above, the bridge speaks **SI units** throughout (kg, m, m/s, K, Pa,
+radians), because it is the engine's own wire contract.
+
+Ask `meta.capabilities` for the command list this wheel can actually run — it is
+build-dependent, and this wheel links the engine with default features off, so the
+PDF- and profile-import-gated commands are not compiled in.
+
 ## License
 
 Dual licensed under MIT or Apache-2.0.

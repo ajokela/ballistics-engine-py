@@ -33,6 +33,7 @@ use ::ballistics_engine::{
     TrajectoryPoint as RustTrajectoryPoint,
 };
 
+mod bridge;
 mod effects;
 mod fast;
 mod helpers;
@@ -721,6 +722,10 @@ fn ballistics_engine(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(effects::compute_spin_drift_advanced, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(effects::compute_spin_drift, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(effects::compute_stability_coefficient, m)?)?;
+
+    // Versioned JSON command bridge: one string-in/string-out entry point onto every
+    // command the engine's service layer exposes (solve, cards, truing, profiles, ...).
+    m.add_function(pyo3::wrap_pyfunction!(bridge::bridge_call, m)?)?;
 
     // Version info
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
