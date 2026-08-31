@@ -49,9 +49,15 @@ use pyo3::prelude::*;
 /// ``profile.import_a7p``) are not compiled in. Ask ``meta.capabilities`` rather than
 /// assuming; it reports exactly what this build can run.
 ///
-/// ``solve`` is the only route to several engine inputs that have no typed wrapper in
-/// this module, among them ``effects.wind_shear_model``,
-/// ``corrections.bc5d_table_path`` and ``atmosphere.pressure_reference``.
+/// ``solve`` is the only route to ``corrections.bc5d_table_path`` and
+/// ``atmosphere.pressure_reference``, which the typed inputs in this module cannot
+/// carry at all.
+///
+/// It is also the better route to ``effects.wind_shear_model``, though not the only
+/// one: the inputs dict has taken ``wind_shear_model`` for some time, but it accepts
+/// any string and an unrecognised one is silently resolved to the power law rather
+/// than reported. The bridge validates it against a typed enum and tells you which
+/// field was wrong.
 ///
 /// Example::
 ///

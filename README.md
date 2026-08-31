@@ -156,9 +156,11 @@ Drag model selection.
 
 The engine's versioned JSON command bridge: one request envelope in, one response
 envelope out, both as strings. It is a transport onto the engine's own service layer,
-so it reaches solve inputs that the typed classes above do not expose at all — among
-them `effects.wind_shear_model`, `corrections.bc5d_table_path` and
-`atmosphere.pressure_reference`.
+so it reaches `corrections.bc5d_table_path` and `atmosphere.pressure_reference`,
+which the typed classes above cannot carry at all. It is also the safer route to
+`effects.wind_shear_model`: the inputs dict has accepted `wind_shear_model` for some
+time, but it takes any string and silently resolves an unrecognised one to the power
+law, where the bridge validates it and names the offending field.
 
 ```python
 import json
