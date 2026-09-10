@@ -25,12 +25,12 @@ use pyo3::prelude::*;
 ///
 /// Success envelope::
 ///
-///     {"ok": true, "api_version": 1, "engine_version": "0.36.3",
+///     {"ok": true, "api_version": 1, "engine_version": "0.37.0",
 ///      "command": "solve", "result": {...}}
 ///
 /// Failure envelope::
 ///
-///     {"ok": false, "api_version": 1, "engine_version": "0.36.3",
+///     {"ok": false, "api_version": 1, "engine_version": "0.37.0",
 ///      "error": {"code": "...", "message": "..."}}
 ///
 /// **Failures come back inside the returned JSON, not as a Python exception.** A

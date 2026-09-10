@@ -25,7 +25,7 @@ import sys
 import ballistics_engine
 from ballistics_engine import bridge_call
 
-EXPECTED_ENGINE_VERSION = "0.36.3"
+EXPECTED_ENGINE_VERSION = "0.37.0"
 
 FAILURES = []
 
