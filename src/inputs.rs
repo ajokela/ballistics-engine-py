@@ -48,8 +48,10 @@
 // monte_carlo_parallel's retired `mc_inputs_to_si` + calculate_zero_angle's manual block).
 
 use ::ballistics_engine::drag::DragTable;
-use ::ballistics_engine::{BCSegmentData, BallisticInputs as RustBallisticInputs, DragModel};
-use pyo3::exceptions::{PyKeyError, PyValueError};
+use ::ballistics_engine::{
+    BCSegmentData, BallisticInputs as RustBallisticInputs, DragModel, StationAtmospherePresence,
+};
+use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -335,11 +337,69 @@ fn resolve_wind_shear_model(d: &Bound<'_, PyDict>, enable_wind_shear: bool) -> P
     })
 }
 
+/// Whether the dict's `value_key` (`temperature` or `pressure`) is a reading the caller
+/// supplied. The optional bool `marker_key` decides when it is present and not `None`, so a
+/// caller that always sends every value key can say which ones the user actually entered.
+/// Otherwise the value is a reading when its key is present and not `None`, or when the caller
+/// supplies it per run as a sampled parameter (`sampled`).
+fn reading_supplied(
+    d: &Bound<'_, PyDict>,
+    value_key: &str,
+    marker_key: &str,
+    sampled: bool,
+) -> PyResult<bool> {
+    if let Some(marker) = d.get_item(marker_key)? {
+        if !marker.is_none() {
+            return marker.extract::<bool>().map_err(|_| {
+                PyTypeError::new_err(format!(
+                    "{marker_key} must be a bool, got {}",
+                    marker.get_type().name().map(|n| n.to_string()).unwrap_or_default()
+                ))
+            });
+        }
+    }
+    Ok(sampled || matches!(d.get_item(value_key)?, Some(v) if !v.is_none()))
+}
+
+/// Which of the dict's station `temperature` / `pressure` are readings (engine 0.49.0): see
+/// `reading_supplied`. `sampled_keys` are the parameter names a Monte Carlo caller sets per
+/// run; a sampled `temperature` or `pressure` is a value the caller supplied, like the key.
+///
+/// A value that is not a reading keeps the engine's legacy rule, so a dict with neither key
+/// (or with both markers false) flies exactly what it always has: at a real altitude a value
+/// within 0.1 °C of 15 °C or 0.5 hPa of 1013.25 hPa becomes the ICAO standard value. A reading
+/// flies exactly as given.
+pub(crate) fn station_presence_from_dict(
+    d: &Bound<'_, PyDict>,
+    sampled_keys: &[String],
+) -> PyResult<StationAtmospherePresence> {
+    let sampled = |key: &str| sampled_keys.iter().any(|k| k == key);
+    Ok(StationAtmospherePresence::new(
+        reading_supplied(d, "temperature", "temperature_supplied", sampled("temperature"))?,
+        reading_supplied(d, "pressure", "pressure_supplied", sampled("pressure"))?,
+    ))
+}
+
+/// `ballistic_inputs_from_dict` plus which of the dict's station temperature and pressure are
+/// readings (`station_presence_from_dict`). Every entry point that flies the dict's own
+/// atmosphere uses this, so a typed reading is never swapped for standard air.
+pub(crate) fn ballistic_inputs_and_presence_from_dict(
+    d: &Bound<'_, PyDict>,
+) -> PyResult<(RustBallisticInputs, StationAtmospherePresence)> {
+    let inputs = ballistic_inputs_from_dict(d)?;
+    let presence = station_presence_from_dict(d, &[])?;
+    Ok((inputs, presence))
+}
+
 /// Build a full engine `BallisticInputs` from an inputs dict, accepting BOTH the rich
 /// ballistics_rust-derived keys and the legacy `PyBallisticInputs` imperial keys (see the
 /// module doc comment for the full alias table and unit conventions). No fields are
 /// hard-required; every field falls back to a sensible default (relaxed from the historical
 /// fast-path contract, which raised `PyKeyError` on a handful of missing keys).
+///
+/// `temperature` (°C) and `pressure` (hPa) default to 15.0 / 1013.25 when absent. The
+/// returned struct cannot say whether they were given; an entry point that flies them uses
+/// `ballistic_inputs_and_presence_from_dict` instead.
 pub(crate) fn ballistic_inputs_from_dict(d: &Bound<'_, PyDict>) -> PyResult<RustBallisticInputs> {
     macro_rules! opt {
         ($key:literal, $default:expr) => {

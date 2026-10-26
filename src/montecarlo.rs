@@ -11,14 +11,17 @@ use pyo3::types::PyDict;
 use rayon::prelude::*;
 use ::ballistics_engine::monte_carlo::{
     calculate_cep, calculate_confidence_ellipse, percentile, sample_points_for_visualization,
-    solve_trajectory_for_monte_carlo, TrajectoryOutput,
+    solve_trajectory_for_monte_carlo_with_station_presence, TrajectoryOutput,
 };
-use ::ballistics_engine::atmosphere::{calculate_atmosphere, resolve_station_conditions};
+use ::ballistics_engine::atmosphere::{
+    calculate_atmosphere, resolve_station_conditions_with_presence, PressureReferenceMode,
+};
 use ::ballistics_engine::spin_drift::{effective_sg_from_inputs, litz_drift_meters};
 use ::ballistics_engine::{
     AtmosphericConditions as RustAtmosphericConditions, BallisticInputs as RustBallisticInputs,
-    TrajectoryPoint as RustTrajectoryPoint, TrajectorySolver as RustTrajectorySolver,
-    WindConditions as RustWindConditions, DEFAULT_HIT_RADIUS_M,
+    StationAtmospherePresence, TrajectoryPoint as RustTrajectoryPoint,
+    TrajectorySolver as RustTrajectorySolver, WindConditions as RustWindConditions,
+    DEFAULT_HIT_RADIUS_M,
 };
 
 const M_TO_INCHES: f64 = 39.3701;
@@ -132,7 +135,13 @@ fn point_at_range(points: &[RustTrajectoryPoint], target_range: f64) -> Option<(
 /// `BallisticInputs` fields directly), solves, and reads the interpolated point at the target
 /// distance -- mirroring what `solve_trajectory_for_monte_carlo` returns so the downstream
 /// CEP/percentile code (which only knows about `TrajectoryOutput`) is untouched.
-fn solve_via_full_solver(ri: &RustBallisticInputs) -> Option<TrajectoryOutput> {
+///
+/// `presence` says which of `ri`'s temperature and pressure are readings; the solve, the Mach
+/// number and the spin-drift Sg all use the same station air it resolves to.
+fn solve_via_full_solver(
+    ri: &RustBallisticInputs,
+    presence: StationAtmospherePresence,
+) -> Option<TrajectoryOutput> {
     let target_distance_m = ri.target_distance;
     if !(target_distance_m.is_finite() && target_distance_m > 0.0) {
         return None;
@@ -154,7 +163,8 @@ fn solve_via_full_solver(ri: &RustBallisticInputs) -> Option<TrajectoryOutput> {
     // solver enough room to reach a long target distance (its own default max_range is a fixed
     // 1000 m, too short for e.g. a 1500 yd sample).
     let solver_max_range = target_distance_m.max(1000.0) * 2.0;
-    let mut solver = RustTrajectorySolver::new(ri.clone(), wind, atmosphere);
+    let mut solver =
+        RustTrajectorySolver::new_with_station_presence(ri.clone(), wind, atmosphere, presence);
     solver.set_max_range(solver_max_range);
 
     let result = solver.solve().ok()?;
@@ -169,10 +179,15 @@ fn solve_via_full_solver(ri: &RustBallisticInputs) -> Option<TrajectoryOutput> {
     let (final_y, final_z, final_vel, final_energy, final_time) =
         point_at_range(&result.points, target_distance_m)?;
 
-    // Same atmosphere resolution solve_trajectory_for_monte_carlo uses, so `mach` here matches
-    // the fast path's for identical inputs.
-    let (resolved_temp_c, resolved_pressure_hpa) =
-        resolve_station_conditions(ri.temperature, ri.pressure, ri.altitude);
+    // Same atmosphere resolution the solver above and solve_trajectory_for_monte_carlo use, so
+    // `mach` here matches the air flown and the fast path's for identical inputs.
+    let (resolved_temp_c, resolved_pressure_hpa) = resolve_station_conditions_with_presence(
+        ri.temperature,
+        ri.pressure,
+        ri.altitude,
+        PressureReferenceMode::Absolute,
+        presence,
+    );
     let (_air_density, speed_of_sound) = calculate_atmosphere(
         ri.altitude,
         Some(resolved_temp_c),
@@ -226,6 +241,12 @@ fn solve_via_full_solver(ri: &RustBallisticInputs) -> Option<TrajectoryOutput> {
 /// exceeds the Phase 3 perf gate's 3x-relative threshold, so the default here is `false`
 /// (opt in explicitly) rather than the originally-planned `true`; see
 /// perf_mba1295_phase3.py and the Phase 3 report for the numbers.
+///
+/// Station air (engine 0.49.0): the base dict's `temperature` / `pressure` is a reading when
+/// its key is present and not `None`, or when it is one of `param_names`, unless the dict's
+/// `temperature_supplied` / `pressure_supplied` key says otherwise. Every sample keeps that
+/// presence. A reading flies as given on both paths; a value that is not one keeps the
+/// engine's legacy rule (ICAO standard air at a real altitude).
 #[pyfunction]
 #[pyo3(signature = (base_inputs, param_samples, param_names, num_threads=None, include_dispersion=true, max_viz_points=500, use_full_solver=true, hit_radius_m=None))]
 #[allow(clippy::too_many_arguments)]
@@ -254,6 +275,7 @@ pub fn monte_carlo_parallel<'py>(
     };
 
     let base = crate::fast::ballistic_inputs_from_dict(base_inputs)?;
+    let presence = crate::inputs::station_presence_from_dict(base_inputs, &param_names)?;
     let samples = param_samples.as_array();
     let n_samples = samples.shape()[0];
     let n_params = samples.shape()[1];
@@ -274,9 +296,9 @@ pub fn monte_carlo_parallel<'py>(
                 }
                 mc_inputs_to_si(&mut ri);
                 if use_full_solver {
-                    solve_via_full_solver(&ri)
+                    solve_via_full_solver(&ri, presence)
                 } else {
-                    solve_trajectory_for_monte_carlo(&ri).ok()
+                    solve_trajectory_for_monte_carlo_with_station_presence(&ri, presence).ok()
                 }
             })
             .collect::<Vec<_>>()
@@ -403,7 +425,8 @@ pub fn monte_carlo_parallel<'py>(
     Ok(out)
 }
 
-/// Wraps the engine's own `run_monte_carlo_with_wind_and_direction_std_dev` (MBA-1295):
+/// Wraps the engine's own `run_monte_carlo_with_wind_and_direction_std_dev` (MBA-1295), in
+/// its presence-aware form `run_monte_carlo_with_station_presence` since engine 0.49.0:
 /// parses `inputs` through the SAME shared rich dict parser as `PyBallisticInputs::from_dict`
 /// / `auto_zero_inputs`, runs the engine's Monte Carlo driver (which internally re-solves a
 /// full `TrajectorySolver` per sample — distinct from `monte_carlo_parallel` above, which
@@ -423,6 +446,10 @@ pub fn monte_carlo_parallel<'py>(
 /// `temperature`/`pressure`/`humidity`/`altitude` (the engine function derives its
 /// atmosphere from the inputs struct, not a separate parameter, so this is the only channel
 /// for supplying atmosphere here — matching `auto_zero_inputs`).
+///
+/// Which temperature and pressure are readings follows `auto_zero_inputs`: `atmo`'s flags when
+/// `atmo` is given, otherwise the dict's keys and its `temperature_supplied` /
+/// `pressure_supplied` markers. A reading flies as given in every trial.
 #[pyfunction]
 #[pyo3(signature = (inputs, params, wind=None, atmo=None, hit_radius_m=None))]
 pub fn run_monte_carlo<'py>(
@@ -434,11 +461,11 @@ pub fn run_monte_carlo<'py>(
     hit_radius_m: Option<f64>,
 ) -> PyResult<Bound<'py, PyDict>> {
     use ::ballistics_engine::{
-        run_monte_carlo_with_wind_and_direction_std_dev, MonteCarloParams,
+        run_monte_carlo_with_station_presence, MonteCarloParams,
         WindConditions as RustWindConditions, DEFAULT_HIT_RADIUS_M,
     };
 
-    let mut bi = crate::inputs::ballistic_inputs_from_dict(inputs)?;
+    let (mut bi, mut presence) = crate::inputs::ballistic_inputs_and_presence_from_dict(inputs)?;
     crate::inputs::full_to_si(&mut bi);
 
     if let Some(a) = &atmo {
@@ -447,6 +474,7 @@ pub fn run_monte_carlo<'py>(
         bi.pressure = r.pressure;
         bi.humidity = r.humidity / 100.0; // AtmosphericConditions.humidity is percent
         bi.altitude = r.altitude;
+        presence = a.presence();
     }
 
     let base_wind = wind.map(|w| w.to_rust()).unwrap_or(RustWindConditions {
@@ -482,11 +510,15 @@ pub fn run_monte_carlo<'py>(
     };
     let wind_direction_std_dev = g("wind_direction_std_dev", 0.001)?;
 
-    let results = run_monte_carlo_with_wind_and_direction_std_dev(
+    // `seed: None` draws from the global RNG, as the presence-blind
+    // `run_monte_carlo_with_wind_and_direction_std_dev` this used to call does.
+    let results = run_monte_carlo_with_station_presence(
         bi,
         base_wind,
         mc_params,
         wind_direction_std_dev,
+        None,
+        presence,
     )
     .map_err(|e| PyValueError::new_err(format!("Monte Carlo run failed: {e}")))?;
 

@@ -39,12 +39,13 @@ wind = WindConditions(
     direction_degrees=90,            # degrees (0=headwind, 90=from right)
 )
 
-# Create atmospheric conditions (optional)
+# Create atmospheric conditions (optional). Pass the readings you have and leave
+# the rest out: a value you pass flies exactly as given.
 atmosphere = AtmosphericConditions(
-    temperature_f=59,                # Fahrenheit
-    pressure_inhg=29.92,             # inHg
+    temperature_f=72,                # Fahrenheit, a reading
+    pressure_inhg=29.31,             # inHg, absolute station pressure (a reading)
     humidity_percent=50,             # percent
-    altitude_feet=0,                 # feet
+    altitude_feet=600,               # feet
 )
 
 # Solve trajectory
@@ -103,13 +104,47 @@ Wind parameters.
 
 ### `AtmosphericConditions`
 
-Atmospheric parameters.
+Atmospheric parameters at the shooter.
 
 **Parameters:**
-- `temperature_f` (float): Temperature in Fahrenheit (default: 59)
-- `pressure_inhg` (float): Barometric pressure in inHg (default: 29.92)
+- `temperature_f` (float or None): Temperature in Fahrenheit. Omit it, or pass `None`, when you have no reading.
+- `pressure_inhg` (float or None): Absolute station pressure in inHg, not a sea-level-corrected altimeter setting. Omit it, or pass `None`, when you have no reading.
 - `humidity_percent` (float): Relative humidity percentage (default: 50)
 - `altitude_feet` (float): Altitude in feet (default: 0)
+
+**Readings and omitted values.** A temperature or pressure you pass is a reading and
+flies exactly as given, whatever its value and whatever the altitude. A real 59 °F or
+29.92 inHg at 5000 ft flies as 59 °F or 29.92 inHg. A value you leave out reads back as
+59 / 29.92 but is not a reading: above 1 m of altitude it flies the ICAO standard air
+at `altitude_feet` (about 41 °F and 24.9 inHg at 5000 ft).
+
+Before engine 0.49.0 the binding could not tell the two apart. At any altitude above
+1 m, a temperature within 0.1 °C of 15 °C (58.82 to 59.18 °F) or a pressure within
+0.5 hPa of 1013.25 hPa (about 29.906 to 29.936 inHg) was treated as omitted and replaced
+with standard air, even when it was a real reading.
+
+`temperature_supplied` and `pressure_supplied` (bool) record which values are readings.
+The constructor sets each one when you pass its value, and assigning `temperature_f` or
+`pressure_inhg` sets it too. You can also set them directly. For example, a caller that
+always fills in a default can pass it and then clear the flag:
+
+```python
+atmo = AtmosphericConditions(temperature_f=59.0, pressure_inhg=form_pressure, altitude_feet=5000)
+atmo.temperature_supplied = False   # 59 was our placeholder, not a reading
+```
+
+### Inputs dicts (`auto_zero_inputs`, `run_monte_carlo`, `monte_carlo_parallel`)
+
+When these functions take the atmosphere from the inputs dict, `temperature` (°C) and
+`pressure` (hPa, absolute) follow the same rule. A key that is present and not `None` is a
+reading. For `monte_carlo_parallel`, a value sampled per run through `param_names` is also a
+reading. A missing key keeps the legacy rule. The optional bool keys `temperature_supplied`
+and `pressure_supplied` override this, for a caller that always sends every key:
+`{"pressure": 1013.25, "pressure_supplied": False}` flies the omitted rule, not 1013.25 hPa.
+A Monte Carlo sample keeps the base dict's presence.
+
+`calculate_zero_angle(inputs, yards, ..., temperature_f=None, pressure_inhg=None, ...)`
+follows the same rule for its keyword arguments.
 
 ### `TrajectorySolver`
 

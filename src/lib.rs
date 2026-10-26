@@ -28,6 +28,7 @@ use ::ballistics_engine::{
     DragModel, BallisticInputs as RustBallisticInputs,
     WindConditions as RustWindConditions,
     AtmosphericConditions as RustAtmosphericConditions,
+    StationAtmospherePresence,
     TrajectorySolver as RustTrajectorySolver,
     TrajectoryResult as RustTrajectoryResult,
     TrajectoryPoint as RustTrajectoryPoint,
@@ -115,31 +116,83 @@ impl PyWindConditions {
     }
 }
 
-/// Atmospheric conditions
+/// The temperature `AtmosphericConditions` stores when none is given, °F.
+const DEFAULT_TEMPERATURE_F: f64 = 59.0;
+/// The station pressure `AtmosphericConditions` stores when none is given, inHg.
+const DEFAULT_PRESSURE_INHG: f64 = 29.92;
+
+/// Atmospheric conditions at the shooter.
+///
+/// `temperature_f` and `pressure_inhg` (absolute station pressure) are readings: pass them when
+/// you have them and leave them out (or pass `None`) when you do not. A reading flies exactly as
+/// given, whatever its value and whatever the altitude, so a real 59 °F or 29.92 inHg at
+/// 5000 ft is flown as 59 °F or 29.92 inHg. A value left out reads back as the 59 °F / 29.92 inHg
+/// default but is not a reading: above 1 m of altitude it flies the ICAO standard air at
+/// `altitude_feet`, as every omitted value always has.
+///
+/// `temperature_supplied` and `pressure_supplied` record which values are readings. The
+/// constructor sets each one when its value is given, and assigning `temperature_f` or
+/// `pressure_inhg` sets it too. Both can be set directly, for a caller that always passes a
+/// value and keeps its own record of which ones the user entered.
 #[pyclass(name = "AtmosphericConditions")]
 #[derive(Clone)]
 pub struct PyAtmosphericConditions {
-    #[pyo3(get, set)]
-    pub temperature_f: f64,
-    #[pyo3(get, set)]
-    pub pressure_inhg: f64,
+    temperature_f: f64,
+    pressure_inhg: f64,
     #[pyo3(get, set)]
     pub humidity_percent: f64,
     #[pyo3(get, set)]
     pub altitude_feet: f64,
+    /// Whether `temperature_f` is a reading the caller supplied.
+    #[pyo3(get, set)]
+    pub temperature_supplied: bool,
+    /// Whether `pressure_inhg` is a reading the caller supplied.
+    #[pyo3(get, set)]
+    pub pressure_supplied: bool,
 }
 
 #[pymethods]
 impl PyAtmosphericConditions {
     #[new]
-    #[pyo3(signature = (temperature_f=59.0, pressure_inhg=29.92, humidity_percent=50.0, altitude_feet=0.0))]
-    fn new(temperature_f: f64, pressure_inhg: f64, humidity_percent: f64, altitude_feet: f64) -> Self {
+    #[pyo3(signature = (temperature_f=None, pressure_inhg=None, humidity_percent=50.0, altitude_feet=0.0))]
+    fn new(
+        temperature_f: Option<f64>,
+        pressure_inhg: Option<f64>,
+        humidity_percent: f64,
+        altitude_feet: f64,
+    ) -> Self {
         PyAtmosphericConditions {
-            temperature_f,
-            pressure_inhg,
+            temperature_f: temperature_f.unwrap_or(DEFAULT_TEMPERATURE_F),
+            pressure_inhg: pressure_inhg.unwrap_or(DEFAULT_PRESSURE_INHG),
             humidity_percent,
             altitude_feet,
+            temperature_supplied: temperature_f.is_some(),
+            pressure_supplied: pressure_inhg.is_some(),
         }
+    }
+
+    /// Station temperature, °F (59 when none was given).
+    #[getter]
+    fn temperature_f(&self) -> f64 {
+        self.temperature_f
+    }
+    /// Assigning a temperature makes it a reading (`temperature_supplied` becomes true).
+    #[setter]
+    fn set_temperature_f(&mut self, v: f64) {
+        self.temperature_f = v;
+        self.temperature_supplied = true;
+    }
+
+    /// Absolute station pressure, inHg (29.92 when none was given).
+    #[getter]
+    fn pressure_inhg(&self) -> f64 {
+        self.pressure_inhg
+    }
+    /// Assigning a pressure makes it a reading (`pressure_supplied` becomes true).
+    #[setter]
+    fn set_pressure_inhg(&mut self, v: f64) {
+        self.pressure_inhg = v;
+        self.pressure_supplied = true;
     }
 }
 
@@ -151,6 +204,11 @@ impl PyAtmosphericConditions {
             humidity: self.humidity_percent,
             altitude: self.altitude_feet * 0.3048,  // feet to meters
         }
+    }
+
+    /// Which of the temperature and pressure the engine must fly as readings.
+    pub(crate) fn presence(&self) -> StationAtmospherePresence {
+        StationAtmospherePresence::new(self.temperature_supplied, self.pressure_supplied)
     }
 }
 
@@ -576,9 +634,16 @@ impl PyTrajectorySolver {
         let bullet_mass_kg = rust_inputs.bullet_mass;
 
         let rust_wind = wind.unwrap_or_else(|| PyWindConditions::new(0.0, 0.0, 0.0)).to_rust();
-        let rust_atmosphere = atmosphere.unwrap_or_else(|| PyAtmosphericConditions::new(59.0, 29.92, 50.0, 0.0)).to_rust();
+        // No atmosphere is sea level with nothing typed.
+        let atmosphere =
+            atmosphere.unwrap_or_else(|| PyAtmosphericConditions::new(None, None, 50.0, 0.0));
 
-        let solver = RustTrajectorySolver::new(rust_inputs, rust_wind, rust_atmosphere);
+        let solver = RustTrajectorySolver::new_with_station_presence(
+            rust_inputs,
+            rust_wind,
+            atmosphere.to_rust(),
+            atmosphere.presence(),
+        );
 
         PyTrajectorySolver {
             solver,
@@ -655,7 +720,7 @@ impl PyTrajectorySolver {
 }
 
 /// Solve the barrel elevation (radians) that zeroes at `zero_distance_yards`, wrapping
-/// `calculate_zero_angle_with_conditions` via the SAME shared rich dict parser as
+/// `calculate_zero_angle_with_station_presence` via the SAME shared rich dict parser as
 /// `PyBallisticInputs::from_dict` (MBA-1295). Lets a caller zero and then solve from ONE
 /// consistent inputs dict — e.g. `BallisticInputs.from_dict(d)` for the solver plus
 /// `auto_zero_inputs(d, ...)` for the muzzle angle to set on it — rather than juggling the
@@ -666,6 +731,12 @@ impl PyTrajectorySolver {
 /// `wind_speed`/`wind_angle` and `temperature`/`pressure`/`humidity`/`altitude` keys (all
 /// defaulting to none/standard atmosphere if absent, matching the dict parser's own
 /// defaults). Raises `RuntimeError` on non-convergence.
+///
+/// A temperature or pressure that is a reading flies as given: from `atmo`, the ones its
+/// `temperature_supplied` / `pressure_supplied` flags mark; from the dict, a `temperature` or
+/// `pressure` key that is present and not `None`, unless the dict's own `temperature_supplied`
+/// / `pressure_supplied` key says otherwise. A value that is not a reading keeps the engine's
+/// legacy rule (ICAO standard air at a real altitude).
 #[pyfunction]
 #[pyo3(signature = (inputs, zero_distance_yards, target_height_inches=0.0, wind=None, atmo=None))]
 pub fn auto_zero_inputs(
@@ -675,7 +746,7 @@ pub fn auto_zero_inputs(
     wind: Option<PyWindConditions>,
     atmo: Option<PyAtmosphericConditions>,
 ) -> PyResult<f64> {
-    let mut bi = crate::inputs::ballistic_inputs_from_dict(inputs)?;
+    let (mut bi, dict_presence) = crate::inputs::ballistic_inputs_and_presence_from_dict(inputs)?;
     crate::inputs::full_to_si(&mut bi);
 
     let rust_wind = wind.map(|w| w.to_rust()).unwrap_or(RustWindConditions {
@@ -683,19 +754,26 @@ pub fn auto_zero_inputs(
         direction: bi.wind_angle,
         vertical_speed: 0.0,
     });
-    let rust_atmo = atmo.map(|a| a.to_rust()).unwrap_or(RustAtmosphericConditions {
-        temperature: bi.temperature,
-        pressure: bi.pressure,
-        humidity: bi.humidity_percent(),
-        altitude: bi.altitude,
-    });
+    let (rust_atmo, presence) = match atmo {
+        Some(a) => (a.to_rust(), a.presence()),
+        None => (
+            RustAtmosphericConditions {
+                temperature: bi.temperature,
+                pressure: bi.pressure,
+                humidity: bi.humidity_percent(),
+                altitude: bi.altitude,
+            },
+            dict_presence,
+        ),
+    };
 
-    ::ballistics_engine::calculate_zero_angle_with_conditions(
+    ::ballistics_engine::calculate_zero_angle_with_station_presence(
         bi,
         zero_distance_yards * YARDS_TO_METERS,
         target_height_inches * INCHES_TO_METERS,
         rust_wind,
         rust_atmo,
+        presence,
     )
     .map_err(|e| {
         PyRuntimeError::new_err(format!(

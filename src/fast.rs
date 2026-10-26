@@ -220,8 +220,13 @@ pub fn derivatives<'py>(
 /// is FULLY imperial (fps/grains/inches/yards) — distinct from fast_integrate's SI
 /// dict — and is converted to SI in place. Raises on non-convergence (engine >=0.17.0
 /// returns Err where it previously returned a best-effort angle).
+///
+/// `temperature_f` and `pressure_inhg` (absolute station pressure) are readings: a value
+/// passed flies exactly as given, whatever it is and whatever the altitude. Leave one out (or
+/// pass `None`) when there is no reading; it then defaults to 59 °F / 29.92 inHg and keeps the
+/// engine's legacy rule, which flies ICAO standard air above 1 m of altitude.
 #[pyfunction]
-#[pyo3(signature = (inputs, target_distance_yards, target_height_inches=0.0, wind_speed_mph=0.0, wind_direction_deg=0.0, temperature_f=59.0, pressure_inhg=29.92, humidity_pct=50.0, altitude_ft=0.0))]
+#[pyo3(signature = (inputs, target_distance_yards, target_height_inches=0.0, wind_speed_mph=0.0, wind_direction_deg=0.0, temperature_f=None, pressure_inhg=None, humidity_pct=50.0, altitude_ft=0.0))]
 #[allow(clippy::too_many_arguments)]
 pub fn calculate_zero_angle(
     inputs: &Bound<'_, PyDict>,
@@ -229,14 +234,19 @@ pub fn calculate_zero_angle(
     target_height_inches: f64,
     wind_speed_mph: f64,
     wind_direction_deg: f64,
-    temperature_f: f64,
-    pressure_inhg: f64,
+    temperature_f: Option<f64>,
+    pressure_inhg: Option<f64>,
     humidity_pct: f64,
     altitude_ft: f64,
 ) -> PyResult<f64> {
     use ::ballistics_engine::{
-        calculate_zero_angle_with_conditions, AtmosphericConditions, WindConditions,
+        calculate_zero_angle_with_station_presence, AtmosphericConditions,
+        StationAtmospherePresence, WindConditions,
     };
+
+    let presence = StationAtmospherePresence::new(temperature_f.is_some(), pressure_inhg.is_some());
+    let temperature_f = temperature_f.unwrap_or(59.0);
+    let pressure_inhg = pressure_inhg.unwrap_or(29.92);
 
     let mut bi = ballistic_inputs_from_dict(inputs)?;
     // Fully-imperial dict -> SI in place (matches ballistics_rust; NOT geometry_mass_to_si).
@@ -261,12 +271,13 @@ pub fn calculate_zero_angle(
         altitude: altitude_ft * 0.3048, // ft -> m
     };
 
-    calculate_zero_angle_with_conditions(
+    calculate_zero_angle_with_station_presence(
         bi,
         target_distance_yards * 0.9144, // yards -> m
         target_height_inches * INCHES_TO_METERS,
         wind,
         atmosphere,
+        presence,
     )
     .map_err(|e| {
         PyRuntimeError::new_err(format!(
