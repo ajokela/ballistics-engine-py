@@ -331,6 +331,13 @@ impl PyBallisticInputs {
     /// raises `ValueError` on a malformed table). Missing keys fall back to sensible
     /// defaults (the original 11-key defaults for the legacy names). `drag_model` accepts a
     /// `DragModel` or a string.
+    ///
+    /// Wind shear: `enable_wind_shear` (default false) turns on boundary-layer shear and
+    /// `wind_shear_model` names the profile (`"power_law"`, `"logarithmic"` or `"none"`).
+    /// Leaving `wind_shear_model` out picks `"power_law"` when `enable_wind_shear` is true
+    /// and `"none"` when it is false; a model you do pass, `"none"` included, is kept
+    /// exactly. The resolved pair reads back through the `enable_wind_shear` and
+    /// `wind_shear_model` properties.
     #[staticmethod]
     fn from_dict(d: &Bound<'_, PyDict>) -> PyResult<Self> {
         let mut inner = crate::inputs::ballistic_inputs_from_dict(d)?;
@@ -514,6 +521,21 @@ impl PyBallisticInputs {
     #[setter]
     fn set_target_height_inches(&mut self, v: f64) {
         self.inner.target_height = v * INCHES_TO_METERS;
+    }
+
+    /// Whether boundary-layer wind shear is enabled. Read-only: set it through
+    /// `BallisticInputs.from_dict` (`enable_wind_shear`), which also resolves the model.
+    #[getter]
+    fn enable_wind_shear(&self) -> bool {
+        self.inner.enable_wind_shear
+    }
+
+    /// The wind shear model as `from_dict` resolved it: the dict's `wind_shear_model` when it
+    /// names one, otherwise `"power_law"` with shear enabled and `"none"` without. Read-only,
+    /// like `enable_wind_shear`.
+    #[getter]
+    fn wind_shear_model(&self) -> String {
+        self.inner.wind_shear_model.clone()
     }
 
     fn __repr__(&self) -> String {

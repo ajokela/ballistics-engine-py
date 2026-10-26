@@ -313,6 +313,28 @@ fn resolve_shooting_angle(d: &Bound<'_, PyDict>) -> PyResult<f64> {
     Ok(0.0)
 }
 
+/// The model `enable_wind_shear` turns on when the dict names none: the CLI's default
+/// `--wind-shear-model` and the profile the C ABI names, since neither lets a caller ask for
+/// shear without getting one.
+const DEFAULT_WIND_SHEAR_MODEL: &str = "power_law";
+
+/// Resolve `wind_shear_model`. A model the dict names, `"none"` included, is kept exactly as
+/// given. When the key is absent (or None) the default follows the flag: `"power_law"` when
+/// `enable_wind_shear` is set, `"none"` when it is not.
+///
+/// The omitted model used to default to `"none"` whatever the flag said, and the engine's
+/// solvers disagreed about what that meant: `TrajectorySolver` fell back to the power law,
+/// while `fast_integrate`, `derivatives` and the fast Monte Carlo kernel applied no shear.
+/// From engine 0.49.0 `TrajectorySolver` reads `"none"` as no shear as well, so without this
+/// default a dict that only set the flag would get no shear on any path.
+fn resolve_wind_shear_model(d: &Bound<'_, PyDict>, enable_wind_shear: bool) -> PyResult<String> {
+    Ok(match opt_string(d, "wind_shear_model")? {
+        Some(model) => model,
+        None if enable_wind_shear => DEFAULT_WIND_SHEAR_MODEL.to_string(),
+        None => "none".to_string(),
+    })
+}
+
 /// Build a full engine `BallisticInputs` from an inputs dict, accepting BOTH the rich
 /// ballistics_rust-derived keys and the legacy `PyBallisticInputs` imperial keys (see the
 /// module doc comment for the full alias table and unit conventions). No fields are
@@ -368,6 +390,8 @@ pub(crate) fn ballistic_inputs_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Rust
     let custom_drag_table = resolve_custom_drag_table(d)?;
     let is_twist_right = bool_field(d, "is_twist_right", Some("is_right_twist"), true)?;
     let shooting_angle = resolve_shooting_angle(d)?;
+    let enable_wind_shear: bool = opt!("enable_wind_shear", false);
+    let wind_shear_model = resolve_wind_shear_model(d, enable_wind_shear)?;
 
     Ok(RustBallisticInputs {
         bc_value,
@@ -417,8 +441,8 @@ pub(crate) fn ballistic_inputs_from_dict(d: &Bound<'_, PyDict>) -> PyResult<Rust
         use_form_factor: opt!("use_form_factor", true),
         manufacturer: opt_string(d, "manufacturer")?,
         bullet_model: opt_string(d, "bullet_model")?,
-        enable_wind_shear: opt!("enable_wind_shear", false),
-        wind_shear_model: opt!("wind_shear_model", "none".to_string()),
+        enable_wind_shear,
+        wind_shear_model,
         use_cluster_bc: opt!("use_cluster_bc", false),
         bullet_cluster,
         custom_drag_table,

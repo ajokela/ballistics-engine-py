@@ -159,8 +159,14 @@ envelope out, both as strings. It is a transport onto the engine's own service l
 so it reaches `corrections.bc5d_table_path` and `atmosphere.pressure_reference`,
 which the typed classes above cannot carry at all. It is also the safer route to
 `effects.wind_shear_model`: the inputs dict has accepted `wind_shear_model` for some
-time, but it takes any string and silently resolves an unrecognised one to the power
-law, where the bridge validates it and names the offending field.
+time, but it takes any string and silently resolves an unrecognised one (to the power
+law in `TrajectorySolver`, to no shear in `fast_integrate`), where the bridge validates
+it and names the offending field.
+
+In the inputs dict, `enable_wind_shear` without a `wind_shear_model` means the power
+law (`"power_law"`, the CLI's default model); with shear off the model defaults to
+`"none"`. A model you name, `"none"` included, is used exactly as given.
+`BallisticInputs.wind_shear_model` reads back the resolved value.
 
 ```python
 import json

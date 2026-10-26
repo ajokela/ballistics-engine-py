@@ -55,9 +55,9 @@ use pyo3::prelude::*;
 ///
 /// It is also the better route to ``effects.wind_shear_model``, though not the only
 /// one: the inputs dict has taken ``wind_shear_model`` for some time, but it accepts
-/// any string and an unrecognised one is silently resolved to the power law rather
-/// than reported. The bridge validates it against a typed enum and tells you which
-/// field was wrong.
+/// any string and an unrecognised one is silently resolved rather than reported (to the
+/// power law in ``TrajectorySolver``, to no shear in ``fast_integrate``). The bridge
+/// validates it against a typed enum and tells you which field was wrong.
 ///
 /// Example::
 ///

@@ -523,6 +523,86 @@ def test_monte_carlo_parallel_hit_probability_sane():
         )
 
 
+def test_wind_shear_model_default_follows_the_flag():
+    """An omitted wind_shear_model resolves from enable_wind_shear: "power_law" when shear is
+    on (the CLI's default model and the profile the C ABI names), "none" when it is off. A
+    model the dict names, "none" included, is kept exactly. Without this, engine 0.49.0's
+    TrajectorySolver, which now reads "none" as no shear the way fast_integrate always did,
+    would leave a dict that only sets the flag with no shear on any path."""
+    print("test_wind_shear_model_default_follows_the_flag")
+    import numpy as np
+
+    from ballistics_engine import derivatives
+
+    def resolved(extra):
+        d = dict(BASE_DICT)
+        d.update(extra)
+        i = BallisticInputs.from_dict(d)
+        return i.enable_wind_shear, i.wind_shear_model
+
+    check(
+        "enabled + omitted -> power_law",
+        resolved({"enable_wind_shear": True}) == (True, "power_law"),
+        str(resolved({"enable_wind_shear": True})),
+    )
+    check(
+        "enabled + None -> power_law (None reads as omitted)",
+        resolved({"enable_wind_shear": True, "wind_shear_model": None}) == (True, "power_law"),
+    )
+    check("flag and model both omitted -> none", resolved({}) == (False, "none"), str(resolved({})))
+    check(
+        "disabled + omitted -> none",
+        resolved({"enable_wind_shear": False}) == (False, "none"),
+    )
+    check(
+        "enabled + explicit none is kept",
+        resolved({"enable_wind_shear": True, "wind_shear_model": "none"}) == (True, "none"),
+        str(resolved({"enable_wind_shear": True, "wind_shear_model": "none"})),
+    )
+    check(
+        "enabled + explicit logarithmic is kept",
+        resolved({"enable_wind_shear": True, "wind_shear_model": "logarithmic"})
+        == (True, "logarithmic"),
+    )
+    check(
+        "disabled + explicit model is kept (the flag still gates it)",
+        resolved({"enable_wind_shear": False, "wind_shear_model": "power_law"})
+        == (False, "power_law"),
+    )
+
+    # The resolved model reaches the physics. derivatives builds its shear wind in this
+    # binding, so this holds on any engine version: 150 m above the muzzle the power law
+    # scales a 36 km/h full-value crosswind well past its surface value.
+    state = np.array([500.0, 150.0, 0.0, 700.0, 0.0, 0.0])
+    atmos = np.array([0.0, 15.0, 1013.25, 1.0])
+    wind = [(36.0, 90.0, 5000.0)]
+
+    def lateral_accel(extra):
+        d = dict(BASE_DICT)
+        d.update(extra)
+        return derivatives(0.0, state, d, wind, atmos, 0.5, 1000.0, 0.0)[5]
+
+    off = lateral_accel({})
+    omitted = lateral_accel({"enable_wind_shear": True})
+    power_law = lateral_accel({"enable_wind_shear": True, "wind_shear_model": "power_law"})
+    explicit_none = lateral_accel({"enable_wind_shear": True, "wind_shear_model": "none"})
+    check(
+        "derivatives: enabled + omitted applies the power law",
+        omitted == power_law,
+        f"omitted={omitted!r} power_law={power_law!r}",
+    )
+    check(
+        "derivatives: the power law changes the answer aloft",
+        omitted != off,
+        f"omitted={omitted!r} off={off!r}",
+    )
+    check(
+        "derivatives: enabled + explicit none applies no shear",
+        explicit_none == off,
+        f"explicit_none={explicit_none!r} off={off!r}",
+    )
+
+
 def main():
     tests = [
         test_backward_compat_legacy_from_dict,
@@ -540,6 +620,7 @@ def main():
         test_run_monte_carlo_hit_probability,
         test_monte_carlo_parallel_full_vs_fast_agreement,
         test_monte_carlo_parallel_hit_probability_sane,
+        test_wind_shear_model_default_follows_the_flag,
     ]
     for t in tests:
         try:
